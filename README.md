@@ -181,7 +181,7 @@ By default, just the metadata of the media is stored in the local database. The 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
 
 ## Running in Docker
-# Example claude config.
+### Example claude config.
 ```json
 {
   "mcpServers": {
