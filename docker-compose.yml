@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   whatsapp-mcp:
     build:
@@ -22,6 +20,8 @@ services:
       - DATABASE_PATH=/app/whatsapp-bridge/store/messages.db
       # MCP transport mode: 'stdio' (default for local) or 'sse' (recommended for Docker)
       - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
+      # MCP server port for SSE transport
+      - MCP_PORT=3000
       # Bridge API URL (localhost since both services are in same container)
       - WHATSAPP_BRIDGE_URL=http://localhost:8080
     restart: unless-stopped

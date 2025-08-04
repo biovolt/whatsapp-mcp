@@ -1,6 +1,6 @@
 # Combined WhatsApp MCP Server Dockerfile
 # Includes both Go (for bridge) and Python (for MCP server) runtimes
-FROM golang:1.21-bookworm AS go-builder
+FROM golang:1.24-bookworm AS go-builder
 
 # Install necessary packages for CGO
 RUN apt-get update && apt-get install -y \
@@ -23,7 +23,7 @@ ENV CGO_ENABLED=1
 RUN go build -o whatsapp-bridge main.go
 
 # Final stage - Python with Go runtime
-FROM python:3.11-bookworm
+FROM python:3.11-slim-bookworm
 
 # Install system dependencies including Go runtime, ffmpeg, and sqlite
 RUN apt-get update && apt-get install -y \
@@ -68,7 +68,7 @@ EXPOSE 3000 8080
 # Set environment variables for proper paths
 ENV WHATSAPP_DB_PATH=/app/whatsapp-bridge/store
 ENV GOPATH=/tmp/go
-ENV GOROOT=/usr/lib/go-1.21
+ENV GOROOT=/usr/lib/go-1.24
 
 # Run the MCP server - it will automatically manage the bridge process
 CMD ["uv", "run", "main.py"]
