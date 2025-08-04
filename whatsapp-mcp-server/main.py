@@ -27,7 +27,7 @@ import sqlite3
 import os
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+mcp = FastMCP("whatsapp", port=3000)
 
 def with_bridge_check(func):
     """Decorator to ensure bridge is ready before executing MCP tools."""
@@ -596,6 +596,6 @@ if __name__ == "__main__":
         # For SSE transport, specify port 3000 to avoid conflicts
         port = int(os.environ.get('MCP_PORT', 3000))
         print(f"SSE transport listening on port {port}")
-        mcp.run(transport=transport_mode, port=port)
-    else:
-        mcp.run(transport=transport_mode)
+    
+    # Initialize and run the server
+    mcp.run(transport=transport_mode)
