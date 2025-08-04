@@ -578,5 +578,18 @@ def check_bridge_status() -> Dict[str, Any]:
     }
 
 if __name__ == "__main__":
+    # Get transport mode from environment variable
+    # Default to 'stdio' for backward compatibility with local installations
+    # Docker environments should set MCP_TRANSPORT=sse
+    transport_mode = os.environ.get('MCP_TRANSPORT', 'stdio')
+    
+    # Validate transport mode
+    valid_transports = ['stdio', 'sse']
+    if transport_mode not in valid_transports:
+        print(f"Warning: Invalid MCP_TRANSPORT '{transport_mode}', defaulting to 'stdio'")
+        transport_mode = 'stdio'
+    
+    print(f"Starting WhatsApp MCP server with {transport_mode} transport...")
+    
     # Initialize and run the server
-    mcp.run(transport='stdio')
+    mcp.run(transport=transport_mode)

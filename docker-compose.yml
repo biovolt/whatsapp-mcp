@@ -37,6 +37,8 @@ services:
       # Configure connection to WhatsApp bridge
       - WHATSAPP_BRIDGE_URL=http://whatsapp-bridge:8080
       - DATABASE_PATH=/app/store/messages.db
+      # MCP transport mode: 'stdio' (default for local) or 'sse' (recommended for Docker)
+      - MCP_TRANSPORT=${MCP_TRANSPORT:-sse}
     restart: unless-stopped
     networks:
       - whatsapp-network

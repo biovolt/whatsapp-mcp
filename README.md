@@ -273,21 +273,126 @@ Access a visual status dashboard at `http://localhost:8080/status` when the brid
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
 
 ## Running in Docker
-### Example claude config.
-```json
-{
-  "mcpServers": {
-    "whatsapp": {
-      "command": "docker",
-      "args": [
-        "exec",
-        "-i",
-        "whatsapp-mcp-server",
-        "uv",
-        "run",
-        "main.py"
-      ]
+
+The WhatsApp MCP server supports containerized deployment using Docker and Docker Compose, providing better isolation, easier deployment, and consistent environments.
+
+### Quick Start
+
+1. **Build and start the containers:**
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **Access the QR code for authentication:**
+   - Web interface: `http://localhost:8080/qr`
+   - Status dashboard: `http://localhost:8080/status`
+
+3. **Configure Claude Desktop** to use the containerized MCP server (see configuration below)
+
+### MCP Transport Modes
+
+The MCP server supports two transport modes, configurable via the `MCP_TRANSPORT` environment variable:
+
+#### **STDIO Transport** (Default for local installations)
+- **Use case:** Local development, direct MCP client connections
+- **Characteristics:** 
+  - Communication via standard input/output streams
+  - Lower latency for local connections
+  - Requires direct process management
+- **Claude Configuration:**
+  ```json
+  {
+    "mcpServers": {
+      "whatsapp": {
+        "command": "uv",
+        "args": ["run", "main.py"],
+        "cwd": "/path/to/whatsapp-mcp-server"
+      }
     }
   }
-}
+  ```
+
+#### **SSE Transport** (Default for Docker)
+- **Use case:** Containerized deployments, web-based integrations
+- **Characteristics:**
+  - Communication via HTTP Server-Sent Events
+  - Better suited for container environments
+  - Enables web-based MCP client connections
+  - Listens on port 3000 by default
+- **Claude Configuration:**
+  ```json
+  {
+    "mcpServers": {
+      "whatsapp": {
+        "command": "docker",
+        "args": [
+          "exec",
+          "-i",
+          "whatsapp-mcp-server",
+          "uv",
+          "run",
+          "main.py"
+        ]
+      }
+    }
+  }
+  ```
+
+### Environment Variables
+
+Configure the Docker deployment using these environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_TRANSPORT` | `sse` (Docker), `stdio` (local) | MCP transport protocol |
+| `WHATSAPP_BRIDGE_URL` | `http://whatsapp-bridge:8080` | Bridge API endpoint |
+| `DATABASE_PATH` | `/app/store/messages.db` | SQLite database path |
+
+### Docker Compose Configuration
+
+The provided `docker-compose.yml` includes:
+
+- **WhatsApp Bridge Container**: Go application handling WhatsApp API communication
+- **MCP Server Container**: Python MCP server with all tools and resources
+- **Shared Volume**: Persistent storage for SQLite databases
+- **Internal Network**: Secure communication between containers
+- **Port Mapping**: Web interface (8080) and MCP server (3000)
+
+### Customizing Transport Mode
+
+To override the default SSE transport in Docker:
+
+```bash
+# Use STDIO transport in Docker (not recommended)
+MCP_TRANSPORT=stdio docker-compose up
+
+# Or set in docker-compose.yml
+environment:
+  - MCP_TRANSPORT=stdio
 ```
+
+To use SSE transport locally:
+
+```bash
+# Set environment variable
+export MCP_TRANSPORT=sse
+uv run main.py
+```
+
+### Transport Mode Implications
+
+| Aspect | STDIO | SSE |
+|--------|-------|-----|
+| **Latency** | Lower | Slightly higher |
+| **Docker Support** | Limited | Excellent |
+| **Web Integration** | Not suitable | Native support |
+| **Process Management** | Direct | Via HTTP |
+| **Debugging** | Terminal logs | HTTP logs + browser tools |
+| **Scalability** | Single instance | Multiple clients possible |
+
+### Recommended Configurations
+
+- **Local Development**: Use STDIO transport with direct Python execution
+- **Production Docker**: Use SSE transport with Docker Compose
+- **CI/CD Pipelines**: Use Docker with SSE transport for testing
+- **Development Docker**: Use SSE transport for consistency with production
