@@ -1,7 +1,7 @@
 from typing import List, Dict, Any, Optional
 import json
 from datetime import datetime
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 # MCP-UI SDK is currently only available for TypeScript/Node.js and Ruby
 # Python implementation doesn't exist yet, so we'll use HTML-based MCP resources
@@ -27,7 +27,7 @@ import sqlite3
 import os
 
 # Initialize FastMCP server
-mcp = FastMCP("whatsapp", port=3000)
+mcp = FastMCP("whatsapp")
 
 def with_bridge_check(func):
     """Decorator to ensure bridge is ready before executing MCP tools."""
@@ -598,4 +598,4 @@ if __name__ == "__main__":
         print(f"SSE transport listening on port {port}")
     
     # Initialize and run the server
-    mcp.run(transport=transport_mode)
+    mcp.run(transport=transport_mode, host="127.0.0.1", port=port)
