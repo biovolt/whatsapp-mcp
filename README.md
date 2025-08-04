@@ -274,11 +274,11 @@ For additional Claude Desktop integration troubleshooting, see the [MCP document
 
 ## Running in Docker
 
-The WhatsApp MCP server supports containerized deployment using Docker and Docker Compose, providing better isolation, easier deployment, and consistent environments.
+The WhatsApp MCP server supports containerized deployment using Docker and Docker Compose. The container includes both the Go bridge and Python MCP server in a single, optimized image that preserves all automatic bridge management features.
 
 ### Quick Start
 
-1. **Build and start the containers:**
+1. **Build and start the container:**
    ```bash
    docker-compose up -d
    ```
@@ -288,6 +288,16 @@ The WhatsApp MCP server supports containerized deployment using Docker and Docke
    - Status dashboard: `http://localhost:8080/status`
 
 3. **Configure Claude Desktop** to use the containerized MCP server (see configuration below)
+
+### Architecture
+
+The Docker deployment uses a **combined container approach** that includes:
+- **Go Bridge**: Compiled binary handling WhatsApp API communication
+- **Go Runtime**: Available for automatic bridge process management
+- **Python MCP Server**: Full MCP functionality with automatic bridge management
+- **Shared Storage**: SQLite databases persisted via Docker volumes
+
+This architecture ensures that all automatic bridge management features (startup, monitoring, QR code capture) work exactly as in local installations.
 
 ### MCP Transport Modes
 
@@ -345,17 +355,18 @@ Configure the Docker deployment using these environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_TRANSPORT` | `sse` (Docker), `stdio` (local) | MCP transport protocol |
-| `WHATSAPP_BRIDGE_URL` | `http://whatsapp-bridge:8080` | Bridge API endpoint |
-| `DATABASE_PATH` | `/app/store/messages.db` | SQLite database path |
+| `WHATSAPP_BRIDGE_URL` | `http://localhost:8080` | Bridge API endpoint (localhost in combined container) |
+| `DATABASE_PATH` | `/app/whatsapp-bridge/store/messages.db` | SQLite database path |
+| `WHATSAPP_DB_PATH` | `/app/whatsapp-bridge/store` | Bridge database directory |
 
 ### Docker Compose Configuration
 
 The provided `docker-compose.yml` includes:
 
-- **WhatsApp Bridge Container**: Go application handling WhatsApp API communication
-- **MCP Server Container**: Python MCP server with all tools and resources
-- **Shared Volume**: Persistent storage for SQLite databases
-- **Internal Network**: Secure communication between containers
+- **Combined Container**: Single container with both Go bridge and Python MCP server
+- **Automatic Bridge Management**: Full subprocess control and monitoring within container
+- **Persistent Storage**: SQLite databases stored in Docker volume
+- **Health Checks**: Container health monitoring via bridge API
 - **Port Mapping**: Web interface (8080) and MCP server (3000)
 
 ### Customizing Transport Mode
