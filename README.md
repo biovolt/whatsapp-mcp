@@ -271,3 +271,23 @@ Access a visual status dashboard at `http://localhost:8080/status` when the brid
 - **Auto-refresh Not Working**: Browser may have JavaScript disabled; manually refresh the page
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
+
+## Running in Docker
+### Example claude config.
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "docker",
+      "args": [
+        "exec",
+        "-i",
+        "whatsapp-mcp-server",
+        "uv",
+        "run",
+        "main.py"
+      ]
+    }
+  }
+}
+```
