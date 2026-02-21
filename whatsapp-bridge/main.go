@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,10 +25,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
-
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -35,10 +37,10 @@ import (
 
 // Global variables for QR code state management
 var (
-	currentQRCode string
+	currentQRCode   string
 	isAuthenticated bool
-	authMutex sync.RWMutex
-	lastQRUpdate time.Time
+	authMutex       sync.RWMutex
+	lastQRUpdate    time.Time
 )
 
 // Message represents a chat message for our client
@@ -76,7 +78,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -91,8 +93,29 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			reply_to_id TEXT,
+			reply_to_sender TEXT,
+			reply_to_content TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS scheduled_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			recipient TEXT NOT NULL,
+			message TEXT,
+			media_path TEXT,
+			scheduled_time TIMESTAMP NOT NULL,
+			status TEXT DEFAULT 'pending',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			sent_at TIMESTAMP,
+			error TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS watched_channels (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
 	if err != nil {
@@ -100,7 +123,142 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	// Run migrations for existing databases
+	store := &MessageStore{db: db}
+	store.runMigrations()
+
+	return store, nil
+}
+
+// Run database migrations for schema updates
+func (store *MessageStore) runMigrations() {
+	// Add reply columns if they don't exist
+	columns := []string{"reply_to_id", "reply_to_sender", "reply_to_content"}
+	for _, col := range columns {
+		// Check if column exists
+		var count int
+		err := store.db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?", col,
+		).Scan(&count)
+		if err != nil || count == 0 {
+			// Column doesn't exist, add it
+			_, err = store.db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s TEXT", col))
+			if err != nil {
+				fmt.Printf("Warning: Could not add column %s: %v\n", col, err)
+			} else {
+				fmt.Printf("Added column %s to messages table\n", col)
+			}
+		}
+	}
+
+	// Add archived column to chats table if it doesn't exist
+	var archivedColCount int
+	err := store.db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('chats') WHERE name = 'archived'",
+	).Scan(&archivedColCount)
+	if err != nil || archivedColCount == 0 {
+		// Column doesn't exist, add it with default value of 0 (not archived)
+		_, err = store.db.Exec("ALTER TABLE chats ADD COLUMN archived BOOLEAN DEFAULT 0")
+		if err != nil {
+			fmt.Printf("Warning: Could not add column archived to chats: %v\n", err)
+		} else {
+			fmt.Printf("Added column archived to chats table\n")
+		}
+	}
+}
+
+// migrateLIDChats moves messages stored under LID JIDs to their phone-number JID equivalents.
+// This is a one-time migration for data stored before LID resolution was added.
+func (store *MessageStore) migrateLIDChats(client *whatsmeow.Client, logger waLog.Logger) {
+	// Find all LID-based chats
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE jid LIKE '%@lid'")
+	if err != nil {
+		logger.Warnf("LID migration: failed to query LID chats: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var lidJIDs []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err == nil {
+			lidJIDs = append(lidJIDs, jid)
+		}
+	}
+
+	if len(lidJIDs) == 0 {
+		return
+	}
+
+	logger.Infof("LID migration: found %d LID-based chats to migrate", len(lidJIDs))
+
+	for _, lidJIDStr := range lidJIDs {
+		lidJID, err := types.ParseJID(lidJIDStr)
+		if err != nil {
+			logger.Warnf("LID migration: failed to parse JID %s: %v", lidJIDStr, err)
+			continue
+		}
+
+		pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), lidJID)
+		if err != nil || pnJID.IsEmpty() {
+			logger.Warnf("LID migration: no phone mapping for LID %s: %v", lidJIDStr, err)
+			continue
+		}
+
+		phoneJIDStr := pnJID.String()
+		logger.Infof("LID migration: migrating %s → %s", lidJIDStr, phoneJIDStr)
+
+		// Ensure the phone-number chat exists
+		var phoneExists int
+		store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", phoneJIDStr).Scan(&phoneExists)
+		if phoneExists == 0 {
+			// Copy the LID chat as the phone chat
+			_, err = store.db.Exec(
+				"INSERT INTO chats (jid, name, last_message_time, archived) SELECT ?, name, last_message_time, archived FROM chats WHERE jid = ?",
+				phoneJIDStr, lidJIDStr,
+			)
+			if err != nil {
+				logger.Warnf("LID migration: failed to create phone chat %s: %v", phoneJIDStr, err)
+				continue
+			}
+		}
+
+		// Reassign messages from LID chat to phone chat.
+		// Use INSERT OR IGNORE to skip duplicates (same message ID in both chats).
+		_, err = store.db.Exec(`
+			INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_content)
+			SELECT id, ?, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_content
+			FROM messages WHERE chat_jid = ?
+		`, phoneJIDStr, lidJIDStr)
+		if err != nil {
+			logger.Warnf("LID migration: failed to migrate messages from %s to %s: %v", lidJIDStr, phoneJIDStr, err)
+			continue
+		}
+
+		// Also update sender fields that contain LID user IDs
+		_, err = store.db.Exec(
+			"UPDATE messages SET sender = ? WHERE chat_jid = ? AND sender = ?",
+			pnJID.User, phoneJIDStr, lidJID.User,
+		)
+		if err != nil {
+			logger.Warnf("LID migration: failed to update senders in %s: %v", phoneJIDStr, err)
+		}
+
+		// Update last_message_time on the phone chat to the most recent message
+		store.db.Exec(`
+			UPDATE chats SET last_message_time = (
+				SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?
+			) WHERE jid = ?
+		`, phoneJIDStr, phoneJIDStr)
+
+		// Delete old LID messages and chat
+		store.db.Exec("DELETE FROM messages WHERE chat_jid = ?", lidJIDStr)
+		store.db.Exec("DELETE FROM chats WHERE jid = ?", lidJIDStr)
+
+		logger.Infof("LID migration: successfully migrated %s → %s", lidJIDStr, phoneJIDStr)
+	}
+
+	logger.Infof("LID migration: complete")
 }
 
 // Close the database connection
@@ -117,19 +275,29 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// SetChatArchived updates the archived status of a chat
+func (store *MessageStore) SetChatArchived(jid string, archived bool) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET archived = ? WHERE jid = ?",
+		archived, jid,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	replyToID, replyToSender, replyToContent string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, replyToID, replyToSender, replyToContent,
 	)
 	return err
 }
@@ -195,7 +363,17 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Extract caption from media messages
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
 	return ""
 }
 
@@ -207,13 +385,602 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient   string `json:"recipient"`
+	Message     string `json:"message"`
+	MediaPath   string `json:"media_path,omitempty"`   // Local file path (Go bridge will read it)
+	MediaURL    string `json:"media_url,omitempty"`    // Remote URL to download and send
+	MediaData   string `json:"media_data,omitempty"`   // Base64-encoded file data
+	Filename    string `json:"filename,omitempty"`     // Original filename (for media_data or media_url)
+	ReplyToID   string `json:"reply_to_id,omitempty"`
+	ReplyToJID  string `json:"reply_to_jid,omitempty"` // JID of the sender of the message being replied to
 }
 
-// Function to send a WhatsApp message
+// ScheduledMessage represents a message scheduled for future delivery
+type ScheduledMessage struct {
+	ID            int64     `json:"id"`
+	Recipient     string    `json:"recipient"`
+	Message       string    `json:"message"`
+	MediaPath     string    `json:"media_path,omitempty"`
+	ScheduledTime time.Time `json:"scheduled_time"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+	SentAt        time.Time `json:"sent_at,omitempty"`
+	Error         string    `json:"error,omitempty"`
+}
+
+// ScheduleMessageRequest represents the request body for scheduling a message
+type ScheduleMessageRequest struct {
+	Recipient     string `json:"recipient"`
+	Message       string `json:"message"`
+	MediaPath     string `json:"media_path,omitempty"`
+	ScheduledTime string `json:"scheduled_time"` // ISO 8601 format
+}
+
+// ScheduleMessageResponse represents the response for the schedule message API
+type ScheduleMessageResponse struct {
+	Success bool              `json:"success"`
+	Message string            `json:"message"`
+	ID      int64             `json:"id,omitempty"`
+	Data    *ScheduledMessage `json:"data,omitempty"`
+}
+
+// Store a scheduled message
+func (store *MessageStore) StoreScheduledMessage(recipient, message, mediaPath string, scheduledTime time.Time) (int64, error) {
+	result, err := store.db.Exec(
+		"INSERT INTO scheduled_messages (recipient, message, media_path, scheduled_time) VALUES (?, ?, ?, ?)",
+		recipient, message, mediaPath, scheduledTime,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// Get a scheduled message by ID
+func (store *MessageStore) GetScheduledMessage(id int64) (*ScheduledMessage, error) {
+	var msg ScheduledMessage
+	var sentAt sql.NullTime
+	var errorMsg sql.NullString
+
+	err := store.db.QueryRow(
+		"SELECT id, recipient, message, media_path, scheduled_time, status, created_at, sent_at, error FROM scheduled_messages WHERE id = ?",
+		id,
+	).Scan(&msg.ID, &msg.Recipient, &msg.Message, &msg.MediaPath, &msg.ScheduledTime, &msg.Status, &msg.CreatedAt, &sentAt, &errorMsg)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if sentAt.Valid {
+		msg.SentAt = sentAt.Time
+	}
+	if errorMsg.Valid {
+		msg.Error = errorMsg.String
+	}
+
+	return &msg, nil
+}
+
+// Get all scheduled messages with optional status filter
+func (store *MessageStore) GetScheduledMessages(status string) ([]ScheduledMessage, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = store.db.Query(
+			"SELECT id, recipient, message, media_path, scheduled_time, status, created_at, sent_at, error FROM scheduled_messages WHERE status = ? ORDER BY scheduled_time ASC",
+			status,
+		)
+	} else {
+		rows, err = store.db.Query(
+			"SELECT id, recipient, message, media_path, scheduled_time, status, created_at, sent_at, error FROM scheduled_messages ORDER BY scheduled_time ASC",
+		)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []ScheduledMessage
+	for rows.Next() {
+		var msg ScheduledMessage
+		var sentAt sql.NullTime
+		var errorMsg sql.NullString
+
+		err := rows.Scan(&msg.ID, &msg.Recipient, &msg.Message, &msg.MediaPath, &msg.ScheduledTime, &msg.Status, &msg.CreatedAt, &sentAt, &errorMsg)
+		if err != nil {
+			return nil, err
+		}
+
+		if sentAt.Valid {
+			msg.SentAt = sentAt.Time
+		}
+		if errorMsg.Valid {
+			msg.Error = errorMsg.String
+		}
+
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+// Get due scheduled messages (pending and scheduled_time <= now)
+func (store *MessageStore) GetDueScheduledMessages() ([]ScheduledMessage, error) {
+	rows, err := store.db.Query(
+		"SELECT id, recipient, message, media_path, scheduled_time, status, created_at FROM scheduled_messages WHERE status = 'pending' AND scheduled_time <= datetime('now') ORDER BY scheduled_time ASC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []ScheduledMessage
+	for rows.Next() {
+		var msg ScheduledMessage
+		err := rows.Scan(&msg.ID, &msg.Recipient, &msg.Message, &msg.MediaPath, &msg.ScheduledTime, &msg.Status, &msg.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+// Update scheduled message status
+func (store *MessageStore) UpdateScheduledMessageStatus(id int64, status string, errorMsg string) error {
+	if status == "sent" {
+		_, err := store.db.Exec(
+			"UPDATE scheduled_messages SET status = ?, sent_at = datetime('now'), error = ? WHERE id = ?",
+			status, errorMsg, id,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		"UPDATE scheduled_messages SET status = ?, error = ? WHERE id = ?",
+		status, errorMsg, id,
+	)
+	return err
+}
+
+// Delete a scheduled message
+func (store *MessageStore) DeleteScheduledMessage(id int64) error {
+	result, err := store.db.Exec("DELETE FROM scheduled_messages WHERE id = ? AND status = 'pending'", id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("scheduled message not found or already processed")
+	}
+	return nil
+}
+
+// WatchedChannel represents a channel being monitored for messages
+type WatchedChannel struct {
+	JID       string    `json:"jid"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// WebhookPayload represents the payload sent to external webhooks
+type WebhookPayload struct {
+	Event     string    `json:"event"`
+	Timestamp time.Time `json:"timestamp"`
+	Chat      struct {
+		JID  string `json:"jid"`
+		Name string `json:"name"`
+	} `json:"chat"`
+	Message struct {
+		ID        string `json:"id"`
+		Sender    string `json:"sender"`
+		Content   string `json:"content"`
+		IsFromMe  bool   `json:"is_from_me"`
+		MediaType string `json:"media_type,omitempty"`
+		Filename  string `json:"filename,omitempty"`
+	} `json:"message"`
+}
+
+// Add a channel to the watch list
+func (store *MessageStore) AddWatchedChannel(jid, name string) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO watched_channels (jid, name, created_at) VALUES (?, ?, datetime('now'))",
+		jid, name,
+	)
+	return err
+}
+
+// Remove a channel from the watch list
+func (store *MessageStore) RemoveWatchedChannel(jid string) error {
+	result, err := store.db.Exec("DELETE FROM watched_channels WHERE jid = ?", jid)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("channel not found in watch list")
+	}
+	return nil
+}
+
+// Get all watched channels
+func (store *MessageStore) GetWatchedChannels() ([]WatchedChannel, error) {
+	rows, err := store.db.Query("SELECT jid, name, created_at FROM watched_channels ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var channels []WatchedChannel
+	for rows.Next() {
+		var ch WatchedChannel
+		err := rows.Scan(&ch.JID, &ch.Name, &ch.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, ch)
+	}
+	return channels, nil
+}
+
+// Check if a channel is being watched
+func (store *MessageStore) IsChannelWatched(jid string) bool {
+	var count int
+	err := store.db.QueryRow("SELECT COUNT(*) FROM watched_channels WHERE jid = ?", jid).Scan(&count)
+	if err != nil {
+		return false
+	}
+	return count > 0
+}
+
+// Get webhook URL from environment
+func getWebhookURL() string {
+	return os.Getenv("WHATSAPP_WEBHOOK_URL")
+}
+
+// Get public base URL for external access (e.g., https://mcp.mini.jyoansah.me)
+// If not set, falls back to localhost:8080
+func getPublicBaseURL() string {
+	url := os.Getenv("WHATSAPP_PUBLIC_URL")
+	if url == "" {
+		return "http://localhost:8080"
+	}
+	// Remove trailing slash if present
+	return strings.TrimSuffix(url, "/")
+}
+
+// Send webhook notification for a watched channel message
+func sendWebhookNotification(chatJID, chatName, messageID, sender, content string, isFromMe bool, mediaType, filename string, logger waLog.Logger) {
+	webhookURL := getWebhookURL()
+	if webhookURL == "" {
+		return
+	}
+
+	payload := WebhookPayload{
+		Event:     "message",
+		Timestamp: time.Now(),
+	}
+	payload.Chat.JID = chatJID
+	payload.Chat.Name = chatName
+	payload.Message.ID = messageID
+	payload.Message.Sender = sender
+	payload.Message.Content = content
+	payload.Message.IsFromMe = isFromMe
+	payload.Message.MediaType = mediaType
+	payload.Message.Filename = filename
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warnf("Failed to marshal webhook payload: %v", err)
+		return
+	}
+
+	go func() {
+		resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			logger.Warnf("Failed to send webhook: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			logger.Infof("Webhook sent successfully for message in %s", chatJID)
+		} else {
+			logger.Warnf("Webhook returned status %d for message in %s", resp.StatusCode, chatJID)
+		}
+	}()
+}
+
+// handleBotCommand processes commands sent via WhatsApp (messages starting with !)
+// Returns true if the message was a command that was handled
+func handleBotCommand(client *whatsmeow.Client, messageStore *MessageStore, chatJID, content string, isFromMe bool, logger waLog.Logger) bool {
+	// Only process commands from self
+	if !isFromMe {
+		return false
+	}
+
+	// Check if message starts with !
+	if !strings.HasPrefix(content, "!") {
+		return false
+	}
+
+	// Parse command and arguments
+	parts := strings.Fields(content)
+	if len(parts) == 0 {
+		return false
+	}
+
+	command := strings.ToLower(parts[0])
+	args := parts[1:]
+
+	var response string
+
+	switch command {
+	case "!watch":
+		if len(args) == 0 {
+			// If no JID provided, watch current chat
+			name := ""
+			var dbName string
+			err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&dbName)
+			if err == nil && dbName != "" {
+				name = dbName
+			} else {
+				name = chatJID
+			}
+			err = messageStore.AddWatchedChannel(chatJID, name)
+			if err != nil {
+				response = fmt.Sprintf("❌ Failed to watch: %v", err)
+			} else {
+				response = fmt.Sprintf("✅ Now watching: %s", name)
+			}
+		} else {
+			// Watch specified JID
+			jid := args[0]
+			name := jid
+			if len(args) > 1 {
+				name = strings.Join(args[1:], " ")
+			} else {
+				var dbName string
+				err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&dbName)
+				if err == nil && dbName != "" {
+					name = dbName
+				}
+			}
+			err := messageStore.AddWatchedChannel(jid, name)
+			if err != nil {
+				response = fmt.Sprintf("❌ Failed to watch: %v", err)
+			} else {
+				response = fmt.Sprintf("✅ Now watching: %s", name)
+			}
+		}
+
+	case "!unwatch":
+		if len(args) == 0 {
+			// Unwatch current chat
+			err := messageStore.RemoveWatchedChannel(chatJID)
+			if err != nil {
+				response = fmt.Sprintf("❌ %v", err)
+			} else {
+				response = "✅ Stopped watching this channel"
+			}
+		} else {
+			jid := args[0]
+			err := messageStore.RemoveWatchedChannel(jid)
+			if err != nil {
+				response = fmt.Sprintf("❌ %v", err)
+			} else {
+				response = fmt.Sprintf("✅ Stopped watching: %s", jid)
+			}
+		}
+
+	case "!watchlist":
+		channels, err := messageStore.GetWatchedChannels()
+		if err != nil {
+			response = fmt.Sprintf("❌ Failed to get watch list: %v", err)
+		} else if len(channels) == 0 {
+			response = "📋 No channels being watched\n\nWebhook URL: " + getWebhookURL()
+		} else {
+			response = fmt.Sprintf("📋 Watching %d channel(s):\n", len(channels))
+			for i, ch := range channels {
+				response += fmt.Sprintf("%d. %s\n   └ %s\n", i+1, ch.Name, ch.JID)
+			}
+			response += "\nWebhook URL: " + getWebhookURL()
+		}
+
+	case "!help":
+		response = `🤖 *WhatsApp Bot Commands*
+
+*Watch List:*
+!watch - Watch current chat
+!watch <jid> [name] - Watch specific chat
+!unwatch - Stop watching current chat
+!unwatch <jid> - Stop watching specific chat
+!watchlist - List all watched channels
+
+*Tips:*
+• Forward a message from a group, then reply with !watch
+• Webhook URL is set via WHATSAPP_WEBHOOK_URL env var`
+
+	default:
+		// Unknown command, don't respond
+		return false
+	}
+
+	// Send response back to the same chat
+	if response != "" {
+		go func() {
+			success, msg := sendWhatsAppMessage(client, chatJID, response, "")
+			if !success {
+				logger.Warnf("Failed to send command response: %s", msg)
+			}
+		}()
+	}
+
+	logger.Infof("Processed bot command: %s", command)
+	return true
+}
+
+// Start the message scheduler that checks for due messages every 30 seconds
+func startScheduler(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		// Run once immediately on startup
+		processScheduledMessages(client, messageStore, logger)
+
+		for range ticker.C {
+			processScheduledMessages(client, messageStore, logger)
+		}
+	}()
+	logger.Infof("Message scheduler started (checking every 30 seconds)")
+}
+
+// Process all due scheduled messages
+func processScheduledMessages(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	if !client.IsConnected() {
+		return
+	}
+
+	messages, err := messageStore.GetDueScheduledMessages()
+	if err != nil {
+		logger.Warnf("Failed to get due scheduled messages: %v", err)
+		return
+	}
+
+	for _, msg := range messages {
+		logger.Infof("Processing scheduled message ID %d to %s", msg.ID, msg.Recipient)
+
+		// Send the message
+		success, resultMsg := sendWhatsAppMessage(client, msg.Recipient, msg.Message, msg.MediaPath)
+
+		if success {
+			err = messageStore.UpdateScheduledMessageStatus(msg.ID, "sent", "")
+			if err != nil {
+				logger.Warnf("Failed to update scheduled message status: %v", err)
+			} else {
+				logger.Infof("Scheduled message ID %d sent successfully", msg.ID)
+			}
+		} else {
+			err = messageStore.UpdateScheduledMessageStatus(msg.ID, "failed", resultMsg)
+			if err != nil {
+				logger.Warnf("Failed to update scheduled message status: %v", err)
+			} else {
+				logger.Warnf("Scheduled message ID %d failed: %s", msg.ID, resultMsg)
+			}
+		}
+	}
+}
+
+// MediaSource represents media to be sent (from various sources)
+type MediaSource struct {
+	Data     []byte
+	Filename string
+	MimeType string
+}
+
+// resolveMedia resolves media from path, URL, or base64 data
+// Returns the media data, filename, and any error
+func resolveMedia(mediaPath, mediaURL, mediaData, filename string) (*MediaSource, error) {
+	// Priority: mediaData > mediaURL > mediaPath
+
+	if mediaData != "" {
+		// Decode base64 data
+		data, err := base64.StdEncoding.DecodeString(mediaData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode base64 media data: %v", err)
+		}
+		if filename == "" {
+			filename = "file"
+		}
+		return &MediaSource{Data: data, Filename: filename}, nil
+	}
+
+	if mediaURL != "" {
+		// Download from URL
+		fmt.Printf("Downloading media from URL: %s\n", mediaURL)
+
+		// Create HTTP client with timeout
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Get(mediaURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download media from URL: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to download media: HTTP %d", resp.StatusCode)
+		}
+
+		// Read response body
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read media data: %v", err)
+		}
+
+		// Determine filename from URL or Content-Disposition header
+		if filename == "" {
+			// Try to get filename from Content-Disposition header
+			if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+				if idx := strings.Index(cd, "filename="); idx >= 0 {
+					fn := cd[idx+9:]
+					fn = strings.Trim(fn, "\"'")
+					if fn != "" {
+						filename = fn
+					}
+				}
+			}
+			// Fallback: extract from URL
+			if filename == "" {
+				urlParts := strings.Split(strings.Split(mediaURL, "?")[0], "/")
+				if len(urlParts) > 0 {
+					filename = urlParts[len(urlParts)-1]
+				}
+				if filename == "" {
+					filename = "downloaded_file"
+				}
+			}
+		}
+
+		fmt.Printf("Downloaded %d bytes, filename: %s\n", len(data), filename)
+		return &MediaSource{Data: data, Filename: filename}, nil
+	}
+
+	if mediaPath != "" {
+		// Read from local file path
+		data, err := os.ReadFile(mediaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read media file: %v", err)
+		}
+
+		// Extract filename from path
+		if filename == "" {
+			filename = filepath.Base(mediaPath)
+		}
+
+		return &MediaSource{Data: data, Filename: filename}, nil
+	}
+
+	return nil, nil // No media provided
+}
+
+// Function to send a WhatsApp message (with optional reply support)
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+	return sendWhatsAppMessageWithReply(client, recipient, message, mediaPath, "", "", "", "", "")
+}
+
+// Function to send a WhatsApp message as a reply to another message
+// mediaPath: local file path (for backward compatibility)
+// mediaURL: remote URL to download
+// mediaDataB64: base64-encoded file data
+// filename: optional filename for URL or base64 data
+func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, message string, mediaPath string, mediaURL string, mediaDataB64 string, filename string, replyToID string, replyToJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -241,16 +1008,29 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	msg := &waProto.Message{}
 
+	// Create context info for replies
+	var contextInfo *waProto.ContextInfo
+	if replyToID != "" {
+		contextInfo = &waProto.ContextInfo{
+			StanzaID:    proto.String(replyToID),
+			Participant: proto.String(replyToJID),
+		}
+	}
+
+	// Resolve media from various sources
+	media, err := resolveMedia(mediaPath, mediaURL, mediaDataB64, filename)
+	if err != nil {
+		return false, fmt.Sprintf("Error resolving media: %v", err)
+	}
+
 	// Check if we have media to send
-	if mediaPath != "" {
-		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
-		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+	if media != nil && len(media.Data) > 0 {
+		// Determine media type and mime type based on file extension
+		var fileExt string
+		if idx := strings.LastIndex(media.Filename, "."); idx >= 0 {
+			fileExt = strings.ToLower(media.Filename[idx+1:])
 		}
 
-		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -293,12 +1073,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 
 		// Upload media to WhatsApp servers
-		resp, err := client.Upload(context.Background(), mediaData, mediaType)
+		resp, err := client.Upload(context.Background(), media.Data, mediaType)
 		if err != nil {
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		fmt.Printf("Media uploaded: URL=%s, FileLength=%d\n", resp.URL, resp.FileLength)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -312,6 +1092,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   contextInfo,
 			}
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
@@ -320,7 +1101,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 			// Try to analyze the ogg file
 			if strings.Contains(mimeType, "ogg") {
-				analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(mediaData)
+				analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(media.Data)
 				if err == nil {
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
@@ -342,6 +1123,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				Seconds:       proto.Uint32(seconds),
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
+				ContextInfo:   contextInfo,
 			}
 		case whatsmeow.MediaVideo:
 			msg.VideoMessage = &waProto.VideoMessage{
@@ -353,10 +1135,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   contextInfo,
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(media.Filename),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -365,10 +1148,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   contextInfo,
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		// For text messages, use ExtendedTextMessage if replying, otherwise Conversation
+		if contextInfo != nil {
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: contextInfo,
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 	}
 
 	// Send message
@@ -379,6 +1171,60 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// Extract reply info from a message's ContextInfo
+func extractReplyInfo(msg *waProto.Message) (replyToID string, replyToSender string, replyToContent string) {
+	if msg == nil {
+		return "", "", ""
+	}
+
+	// Check different message types for ContextInfo
+	var contextInfo *waProto.ContextInfo
+
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		contextInfo = ext.GetContextInfo()
+	} else if img := msg.GetImageMessage(); img != nil {
+		contextInfo = img.GetContextInfo()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		contextInfo = vid.GetContextInfo()
+	} else if aud := msg.GetAudioMessage(); aud != nil {
+		contextInfo = aud.GetContextInfo()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		contextInfo = doc.GetContextInfo()
+	}
+
+	if contextInfo == nil {
+		return "", "", ""
+	}
+
+	replyToID = contextInfo.GetStanzaID()
+	replyToSender = contextInfo.GetParticipant()
+
+	// Extract content from quoted message
+	if quotedMsg := contextInfo.GetQuotedMessage(); quotedMsg != nil {
+		replyToContent = extractTextContent(quotedMsg)
+		// If no text content, check for media type
+		if replyToContent == "" {
+			if quotedMsg.GetImageMessage() != nil {
+				replyToContent = "[Image]"
+			} else if quotedMsg.GetVideoMessage() != nil {
+				replyToContent = "[Video]"
+			} else if quotedMsg.GetAudioMessage() != nil {
+				replyToContent = "[Audio]"
+			} else if quotedMsg.GetDocumentMessage() != nil {
+				replyToContent = "[Document]"
+			} else if quotedMsg.GetStickerMessage() != nil {
+				replyToContent = "[Sticker]"
+			}
+		}
+		// Truncate if too long
+		if len(replyToContent) > 100 {
+			replyToContent = replyToContent[:100] + "..."
+		}
+	}
+
+	return replyToID, replyToSender, replyToContent
 }
 
 // Extract media info from a message
@@ -401,7 +1247,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		audioType := "audio"
+		if aud.GetPTT() {
+			audioType = "voice_note"
+		}
+		return audioType, "audio_" + time.Now().Format("20060102_150405") + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -415,17 +1265,60 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
 	}
 
+	// Check for sticker message
+	if sticker := msg.GetStickerMessage(); sticker != nil {
+		return "sticker", "sticker_" + time.Now().Format("20060102_150405") + ".webp",
+			sticker.GetURL(), sticker.GetMediaKey(), sticker.GetFileSHA256(), sticker.GetFileEncSHA256(), sticker.GetFileLength()
+	}
+
 	return "", "", "", nil, nil, nil, 0
 }
 
 // Handle regular incoming messages with media support
+// resolveLIDToPhone resolves a LID-based JID to its phone-number-based JID.
+// WhatsApp is migrating from phone JIDs (e.g. 233201358015@s.whatsapp.net) to
+// LID JIDs (e.g. 15788434030727@lid). This causes the same contact to appear
+// as two separate chats. We resolve LIDs to phone JIDs so all messages for the
+// same contact are stored under a single, consistent chat JID.
+func resolveLIDToPhone(client *whatsmeow.Client, jid types.JID, logger waLog.Logger) (types.JID, string) {
+	if jid.Server != types.HiddenUserServer {
+		return jid, jid.String()
+	}
+
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pnJID.IsEmpty() {
+		logger.Warnf("Could not resolve LID %s to phone number: %v", jid.String(), err)
+		return jid, jid.String()
+	}
+
+	logger.Infof("Resolved LID %s → phone %s", jid.String(), pnJID.String())
+	return pnJID, pnJID.String()
+}
+
+// resolveLIDSender resolves a LID sender user ID to the phone number equivalent.
+// This is for the sender field (just the user part, not a full JID).
+func resolveLIDSender(client *whatsmeow.Client, sender string, senderJID types.JID, logger waLog.Logger) string {
+	if senderJID.Server != types.HiddenUserServer {
+		return sender
+	}
+
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), senderJID)
+	if err != nil || pnJID.IsEmpty() {
+		return sender
+	}
+
+	logger.Infof("Resolved sender LID %s → phone %s", sender, pnJID.User)
+	return pnJID.User
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Resolve LID JIDs to phone-number JIDs for consistent storage
+	resolvedChat, chatJID := resolveLIDToPhone(client, msg.Info.Chat, logger)
+	sender := resolveLIDSender(client, msg.Info.Sender.User, msg.Info.Sender, logger)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -436,8 +1329,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Check for bot commands (messages from self starting with !)
+	if content != "" && handleBotCommand(client, messageStore, chatJID, content, msg.Info.IsFromMe, logger) {
+		// Command was handled, still store it but don't process further
+		logger.Infof("Bot command processed: %s", content)
+	}
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+
+	// Extract reply info
+	replyToID, replyToSender, replyToContent := extractReplyInfo(msg.Message)
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
@@ -459,6 +1361,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		replyToID,
+		replyToSender,
+		replyToContent,
 	)
 
 	if err != nil {
@@ -477,6 +1382,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Check if this channel is being watched and send webhook
+		if messageStore.IsChannelWatched(chatJID) {
+			sendWebhookNotification(chatJID, name, msg.Info.ID, sender, content, msg.Info.IsFromMe, mediaType, filename, logger)
+		}
 	}
 }
 
@@ -488,10 +1398,14 @@ type DownloadMediaRequest struct {
 
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
-	Success  bool   `json:"success"`
-	Message  string `json:"message"`
-	Filename string `json:"filename,omitempty"`
-	Path     string `json:"path,omitempty"`
+	Success       bool   `json:"success"`
+	Message       string `json:"message"`
+	Filename      string `json:"filename,omitempty"`
+	Path          string `json:"path,omitempty"`
+	MediaURL      string `json:"media_url,omitempty"`       // Relative URL path (e.g., /api/media/...)
+	PublicURL     string `json:"public_url,omitempty"`      // Full public URL for external access
+	MediaType     string `json:"media_type,omitempty"`
+	AccessNote    string `json:"access_note,omitempty"`     // Instructions for accessing the media
 }
 
 // Store additional media info in the database
@@ -708,15 +1622,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+		if req.Message == "" && req.MediaPath == "" && req.MediaURL == "" && req.MediaData == "" {
+			http.Error(w, "Message, media_path, media_url, or media_data is required", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Println("Received request to send message", req.Message, "media_path:", req.MediaPath, "media_url:", req.MediaURL, "reply_to:", req.ReplyToID)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// Send the message (with optional reply support)
+		success, message := sendWhatsAppMessageWithReply(client, req.Recipient, req.Message, req.MediaPath, req.MediaURL, req.MediaData, req.Filename, req.ReplyToID, req.ReplyToJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -775,13 +1689,994 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		// Generate URL path for the media file
+		// The path is relative to "store/", so we extract that part
+		// Path format: /abs/path/to/store/<chat_jid>/<filename>
+		// We need to construct URL as /api/media/<chat_jid>/<filename>
+		chatDirSafe := strings.ReplaceAll(req.ChatJID, ":", "_")
+		mediaURL := fmt.Sprintf("/api/media/%s/%s", chatDirSafe, filename)
+
+		// Get public base URL and construct full public URL
+		publicBaseURL := getPublicBaseURL()
+		publicURL := publicBaseURL + mediaURL
+
+		// Generate access note based on whether public URL is configured
+		var accessNote string
+		if os.Getenv("WHATSAPP_PUBLIC_URL") != "" {
+			accessNote = fmt.Sprintf("Media is accessible at the public_url. You can fetch it directly using: curl '%s'", publicURL)
+		} else {
+			accessNote = fmt.Sprintf("Media is stored locally at: %s. For remote access, set WHATSAPP_PUBLIC_URL environment variable.", path)
+		}
+
 		// Send successful response
 		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
+			Success:    true,
+			Message:    fmt.Sprintf("Successfully downloaded %s media", mediaType),
+			Filename:   filename,
+			Path:       path,
+			MediaURL:   mediaURL,
+			PublicURL:  publicURL,
+			MediaType:  mediaType,
+			AccessNote: accessNote,
 		})
+	})
+
+	// Handler for serving media files via HTTP
+	http.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract the path after /api/media/
+		// Expected format: /api/media/<chat_jid>/<filename>
+		pathParts := strings.TrimPrefix(r.URL.Path, "/api/media/")
+		if pathParts == "" {
+			http.Error(w, "Invalid media path", http.StatusBadRequest)
+			return
+		}
+
+		// Security: prevent path traversal attacks
+		if strings.Contains(pathParts, "..") {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		// Construct the full file path
+		filePath := filepath.Join("store", pathParts)
+
+		// Check if file exists
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+
+		// Determine content type based on file extension
+		ext := strings.ToLower(filepath.Ext(filePath))
+		contentType := "application/octet-stream"
+		switch ext {
+		case ".jpg", ".jpeg":
+			contentType = "image/jpeg"
+		case ".png":
+			contentType = "image/png"
+		case ".gif":
+			contentType = "image/gif"
+		case ".webp":
+			contentType = "image/webp"
+		case ".mp4":
+			contentType = "video/mp4"
+		case ".avi":
+			contentType = "video/avi"
+		case ".mov":
+			contentType = "video/quicktime"
+		case ".ogg":
+			contentType = "audio/ogg"
+		case ".mp3":
+			contentType = "audio/mpeg"
+		case ".pdf":
+			contentType = "application/pdf"
+		}
+
+		w.Header().Set("Content-Type", contentType)
+		http.ServeFile(w, r, filePath)
+	})
+
+	// Handler for scheduling messages
+	http.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodPost:
+			// Schedule a new message
+			var req ScheduleMessageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Invalid request format",
+				})
+				return
+			}
+
+			// Validate request
+			if req.Recipient == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Recipient is required",
+				})
+				return
+			}
+
+			if req.Message == "" && req.MediaPath == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Message or media path is required",
+				})
+				return
+			}
+
+			if req.ScheduledTime == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Scheduled time is required",
+				})
+				return
+			}
+
+			// Parse scheduled time (ISO 8601 format)
+			scheduledTime, err := time.Parse(time.RFC3339, req.ScheduledTime)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("Invalid scheduled_time format. Use ISO 8601 (RFC3339): %v", err),
+				})
+				return
+			}
+
+			// Check if scheduled time is in the future
+			if scheduledTime.Before(time.Now()) {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Scheduled time must be in the future",
+				})
+				return
+			}
+
+			// Store scheduled message
+			id, err := messageStore.StoreScheduledMessage(req.Recipient, req.Message, req.MediaPath, scheduledTime)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("Failed to schedule message: %v", err),
+				})
+				return
+			}
+
+			// Get the created message
+			msg, _ := messageStore.GetScheduledMessage(id)
+
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: true,
+				Message: fmt.Sprintf("Message scheduled for %s", scheduledTime.Format(time.RFC3339)),
+				ID:      id,
+				Data:    msg,
+			})
+
+		case http.MethodGet:
+			// List scheduled messages
+			status := r.URL.Query().Get("status")
+			messages, err := messageStore.GetScheduledMessages(status)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to get scheduled messages: %v", err),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data":    messages,
+				"count":   len(messages),
+			})
+
+		case http.MethodDelete:
+			// Delete a scheduled message (requires id query param)
+			idStr := r.URL.Query().Get("id")
+			if idStr == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Message ID is required",
+				})
+				return
+			}
+
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Invalid message ID",
+				})
+				return
+			}
+
+			err = messageStore.DeleteScheduledMessage(id)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: err.Error(),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: true,
+				Message: "Scheduled message cancelled",
+				ID:      id,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Method not allowed",
+			})
+		}
+	})
+
+	// Webhook handler for external scheduling triggers
+	http.HandleFunc("/api/webhook/schedule", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Method not allowed",
+			})
+			return
+		}
+
+		var req ScheduleMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Invalid request format",
+			})
+			return
+		}
+
+		// Validate request
+		if req.Recipient == "" || (req.Message == "" && req.MediaPath == "") {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Recipient and message/media_path are required",
+			})
+			return
+		}
+
+		// If no scheduled time provided, send immediately
+		if req.ScheduledTime == "" {
+			success, resultMsg := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: success,
+				Message: resultMsg,
+			})
+			return
+		}
+
+		// Parse and schedule for later
+		scheduledTime, err := time.Parse(time.RFC3339, req.ScheduledTime)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Invalid scheduled_time format: %v", err),
+			})
+			return
+		}
+
+		// If scheduled time is in the past or within 30 seconds, send immediately
+		if time.Until(scheduledTime) < 30*time.Second {
+			success, resultMsg := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: success,
+				Message: resultMsg,
+			})
+			return
+		}
+
+		// Schedule for later
+		id, err := messageStore.StoreScheduledMessage(req.Recipient, req.Message, req.MediaPath, scheduledTime)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to schedule: %v", err),
+			})
+			return
+		}
+
+		msg, _ := messageStore.GetScheduledMessage(id)
+		json.NewEncoder(w).Encode(ScheduleMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Scheduled for %s", scheduledTime.Format(time.RFC3339)),
+			ID:      id,
+			Data:    msg,
+		})
+	})
+
+	// Handler for archiving/unarchiving chats
+	http.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed",
+			})
+			return
+		}
+
+		var req struct {
+			JID     string `json:"jid"`
+			Archive bool   `json:"archive"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Invalid request format",
+			})
+			return
+		}
+
+		if req.JID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "JID is required",
+			})
+			return
+		}
+
+		// Parse the JID
+		targetJID, err := types.ParseJID(req.JID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Invalid JID: %v", err),
+			})
+			return
+		}
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Build and send the archive app state patch
+		patch := appstate.BuildArchive(targetJID, req.Archive, time.Time{}, nil)
+		err = client.SendAppState(context.Background(), patch)
+		if err != nil {
+			// Check if this is an LTHash mismatch / 409 conflict error
+			errStr := err.Error()
+			if strings.Contains(errStr, "LTHash") || strings.Contains(errStr, "409") || strings.Contains(errStr, "conflict") {
+				fmt.Printf("App state desync detected for archive operation, performing full resync of regular_low...\n")
+
+				// Force a full resync of the regular_low app state
+				resyncErr := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false)
+				if resyncErr != nil {
+					fmt.Printf("Warning: app state resync failed: %v\n", resyncErr)
+				} else {
+					fmt.Printf("App state resync completed, retrying archive operation...\n")
+				}
+
+				// Retry the archive operation regardless of resync result
+				patch = appstate.BuildArchive(targetJID, req.Archive, time.Time{}, nil)
+				err = client.SendAppState(context.Background(), patch)
+			}
+
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to archive chat: %v", err),
+				})
+				return
+			}
+		}
+
+		// Update the archived status in the local database
+		err = messageStore.SetChatArchived(req.JID, req.Archive)
+		if err != nil {
+			// Log the error but don't fail the request since WhatsApp was updated successfully
+			fmt.Printf("Warning: Could not update archived status in database: %v\n", err)
+		}
+
+		action := "archived"
+		if !req.Archive {
+			action = "unarchived"
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": fmt.Sprintf("Chat %s successfully", action),
+			"jid":     req.JID,
+			"archive": req.Archive,
+		})
+	})
+
+	// Handler for resyncing app state (fixes LTHash desync issues)
+	http.HandleFunc("/api/resync-state", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed",
+			})
+			return
+		}
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Parse optional request body for specific state names
+		var req struct {
+			Names []string `json:"names"` // e.g., ["regular_low", "regular_high"]
+			Force bool     `json:"force"` // wipe local app state tables before fetching (fixes corrupt LTHash)
+		}
+		// Body is optional - if empty or invalid, resync all states
+		json.NewDecoder(r.Body).Decode(&req)
+
+		// Map of valid state names
+		stateNames := map[string]appstate.WAPatchName{
+			"regular_low":          appstate.WAPatchRegularLow,
+			"regular_high":         appstate.WAPatchRegularHigh,
+			"regular":              appstate.WAPatchRegular,
+			"critical_block":       appstate.WAPatchCriticalBlock,
+			"critical_unblock_low": appstate.WAPatchCriticalUnblockLow,
+		}
+
+		// Determine which states to resync
+		var toResync []appstate.WAPatchName
+		if len(req.Names) > 0 {
+			for _, name := range req.Names {
+				if patchName, ok := stateNames[name]; ok {
+					toResync = append(toResync, patchName)
+				}
+			}
+		}
+		if len(toResync) == 0 {
+			// Default: resync the most commonly problematic states
+			toResync = []appstate.WAPatchName{
+				appstate.WAPatchRegularLow,
+				appstate.WAPatchRegularHigh,
+			}
+		}
+
+		// When force=true, wipe the local app state snapshot from SQLite before
+		// fetching. A normal FetchAppState(true) still tries to verify the local
+		// snapshot's LTHash before applying server patches — if the snapshot itself
+		// is corrupt the verification fails and the resync cannot recover. Wiping
+		// the rows resets the local version to 0, so WhatsApp sends a full fresh
+		// snapshot instead of incremental patches, bypassing the broken LTHash.
+		if req.Force {
+			fmt.Printf("Force resync requested — wiping local app state tables before fetching\n")
+			wipeDB, wipeErr := sql.Open("sqlite3", "file:store/whatsapp.db?_foreign_keys=off")
+			if wipeErr != nil {
+				fmt.Printf("Warning: could not open whatsapp.db for wipe: %v\n", wipeErr)
+			} else {
+				defer wipeDB.Close()
+				for _, name := range toResync {
+					nameStr := string(name)
+					_, err1 := wipeDB.ExecContext(context.Background(),
+						"DELETE FROM whatsmeow_app_state_version WHERE name=?", nameStr)
+					_, err2 := wipeDB.ExecContext(context.Background(),
+						"DELETE FROM whatsmeow_app_state_mutation_macs WHERE name=?", nameStr)
+					if err1 != nil || err2 != nil {
+						fmt.Printf("Warning: wipe of %s partial — version_err=%v macs_err=%v\n", nameStr, err1, err2)
+					} else {
+						fmt.Printf("Wiped local app state for %s\n", nameStr)
+					}
+				}
+			}
+		}
+
+		results := make([]map[string]interface{}, 0, len(toResync))
+		allSuccess := true
+		for _, name := range toResync {
+			fmt.Printf("Resyncing app state: %s (force=%v)\n", name, req.Force)
+			err := client.FetchAppState(context.Background(), name, true, false)
+			result := map[string]interface{}{
+				"name":    string(name),
+				"success": err == nil,
+			}
+			if err != nil {
+				result["error"] = err.Error()
+				allSuccess = false
+				fmt.Printf("Failed to resync %s: %v\n", name, err)
+			} else {
+				fmt.Printf("Successfully resynced %s\n", name)
+			}
+			results = append(results, result)
+		}
+
+		status := http.StatusOK
+		if !allSuccess {
+			status = http.StatusInternalServerError
+		}
+		action := "Resynced"
+		if req.Force {
+			action = "Force-resynced"
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": allSuccess,
+			"message": fmt.Sprintf("%s %d app state(s)", action, len(toResync)),
+			"force":   req.Force,
+			"results": results,
+		})
+	})
+
+	// Handler for managing watched channels
+	http.HandleFunc("/api/watch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodPost:
+			// Add a channel to watch list
+			var req struct {
+				JID  string `json:"jid"`
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "Invalid request format",
+				})
+				return
+			}
+
+			if req.JID == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "JID is required",
+				})
+				return
+			}
+
+			// If no name provided, try to get it from the database
+			name := req.Name
+			if name == "" {
+				var dbName string
+				err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", req.JID).Scan(&dbName)
+				if err == nil && dbName != "" {
+					name = dbName
+				} else {
+					name = req.JID
+				}
+			}
+
+			err := messageStore.AddWatchedChannel(req.JID, name)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to add watched channel: %v", err),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Now watching channel: %s", name),
+				"jid":     req.JID,
+				"name":    name,
+			})
+
+		case http.MethodGet:
+			// List all watched channels
+			channels, err := messageStore.GetWatchedChannels()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to get watched channels: %v", err),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":     true,
+				"channels":    channels,
+				"count":       len(channels),
+				"webhook_url": getWebhookURL(),
+			})
+
+		case http.MethodDelete:
+			// Remove a channel from watch list
+			jid := r.URL.Query().Get("jid")
+			if jid == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "JID query parameter is required",
+				})
+				return
+			}
+
+			err := messageStore.RemoveWatchedChannel(jid)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": err.Error(),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "Channel removed from watch list",
+				"jid":     jid,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed",
+			})
+		}
+	})
+
+	// Handler for getting group info (including members)
+	http.HandleFunc("/api/group", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed. Use GET with ?jid=<group_jid>",
+			})
+			return
+		}
+
+		// Get group JID from query parameter
+		groupJID := r.URL.Query().Get("jid")
+		if groupJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "JID query parameter is required",
+			})
+			return
+		}
+
+		// Parse the JID
+		jid, err := types.ParseJID(groupJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Invalid JID: %v", err),
+			})
+			return
+		}
+
+		// Verify it's a group JID
+		if jid.Server != "g.us" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "JID must be a group (ending with @g.us)",
+			})
+			return
+		}
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Get group info
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get group info: %v", err),
+			})
+			return
+		}
+
+		// Build participants list
+		participants := make([]map[string]interface{}, 0)
+		for _, p := range groupInfo.Participants {
+			participant := map[string]interface{}{
+				"jid":      p.JID.String(),
+				"is_admin": p.IsAdmin,
+				"is_super_admin": p.IsSuperAdmin,
+			}
+			// Try to get contact name
+			contact, err := client.Store.Contacts.GetContact(context.Background(), p.JID)
+			if err == nil && contact.FullName != "" {
+				participant["name"] = contact.FullName
+			} else if contact.PushName != "" {
+				participant["name"] = contact.PushName
+			}
+			participants = append(participants, participant)
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"jid":          groupJID,
+			"name":         groupInfo.Name,
+			"topic":        groupInfo.Topic,
+			"created_at":   groupInfo.GroupCreated,
+			"owner_jid":    groupInfo.OwnerJID.String(),
+			"participants": participants,
+			"participant_count": len(participants),
+		})
+	})
+
+	// Handler for managing group members (add/remove)
+	http.HandleFunc("/api/group/members", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			// Add member(s) to group
+			var req struct {
+				GroupJID     string   `json:"group_jid"`
+				Participants []string `json:"participants"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "Invalid request format",
+				})
+				return
+			}
+
+			if req.GroupJID == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "group_jid is required",
+				})
+				return
+			}
+
+			if len(req.Participants) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "participants array is required and must not be empty",
+				})
+				return
+			}
+
+			// Parse group JID
+			groupJID, err := types.ParseJID(req.GroupJID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Invalid group JID: %v", err),
+				})
+				return
+			}
+
+			// Parse participant JIDs
+			participantJIDs := make([]types.JID, 0)
+			for _, p := range req.Participants {
+				// If no @ sign, assume it's a phone number
+				if !strings.Contains(p, "@") {
+					p = p + "@s.whatsapp.net"
+				}
+				pJID, err := types.ParseJID(p)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"success": false,
+						"message": fmt.Sprintf("Invalid participant JID %s: %v", p, err),
+					})
+					return
+				}
+				participantJIDs = append(participantJIDs, pJID)
+			}
+
+			// Add participants to group
+			result, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, whatsmeow.ParticipantChangeAdd)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to add participants: %v", err),
+				})
+				return
+			}
+
+			// Build result info
+			resultInfo := make([]map[string]interface{}, 0)
+			for _, r := range result {
+				info := map[string]interface{}{
+					"jid":   r.JID.String(),
+					"error": "",
+				}
+				if r.Error != 0 {
+					info["error"] = fmt.Sprintf("Error code: %d", r.Error)
+				}
+				if r.AddRequest != nil {
+					info["add_request"] = r.AddRequest.Code
+				}
+				resultInfo = append(resultInfo, info)
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  true,
+				"message":  fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
+				"group_jid": req.GroupJID,
+				"results":  resultInfo,
+			})
+
+		case http.MethodDelete:
+			// Remove member(s) from group
+			var req struct {
+				GroupJID     string   `json:"group_jid"`
+				Participants []string `json:"participants"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "Invalid request format",
+				})
+				return
+			}
+
+			if req.GroupJID == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "group_jid is required",
+				})
+				return
+			}
+
+			if len(req.Participants) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "participants array is required and must not be empty",
+				})
+				return
+			}
+
+			// Parse group JID
+			groupJID, err := types.ParseJID(req.GroupJID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Invalid group JID: %v", err),
+				})
+				return
+			}
+
+			// Parse participant JIDs
+			participantJIDs := make([]types.JID, 0)
+			for _, p := range req.Participants {
+				// If no @ sign, assume it's a phone number
+				if !strings.Contains(p, "@") {
+					p = p + "@s.whatsapp.net"
+				}
+				pJID, err := types.ParseJID(p)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"success": false,
+						"message": fmt.Sprintf("Invalid participant JID %s: %v", p, err),
+					})
+					return
+				}
+				participantJIDs = append(participantJIDs, pJID)
+			}
+
+			// Remove participants from group
+			result, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, whatsmeow.ParticipantChangeRemove)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to remove participants: %v", err),
+				})
+				return
+			}
+
+			// Build result info
+			resultInfo := make([]map[string]interface{}, 0)
+			for _, r := range result {
+				info := map[string]interface{}{
+					"jid":   r.JID.String(),
+					"error": "",
+				}
+				if r.Error != 0 {
+					info["error"] = fmt.Sprintf("Error code: %d", r.Error)
+				}
+				resultInfo = append(resultInfo, info)
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  true,
+				"message":  fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
+				"group_jid": req.GroupJID,
+				"results":  resultInfo,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed. Use POST to add members, DELETE to remove members",
+			})
+		}
 	})
 
 	// Handler for QR code HTML page
@@ -855,7 +2750,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 </head>
 <body>
     <div class="container">
-        <div class="success-icon">✅</div>
+        <div class="success-icon">&#10004;</div>
         <h1>WhatsApp Authentication</h1>
         <div class="status">
             <strong>Status:</strong> Successfully authenticated and connected to WhatsApp!
@@ -923,7 +2818,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 </head>
 <body>
     <div class="container">
-        <div class="loading">⏳</div>
+        <div class="loading">&#8987;</div>
         <h1>WhatsApp Authentication</h1>
         <div class="status">
             <strong>Status:</strong> Generating QR code...
@@ -1033,16 +2928,16 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 </head>
 <body>
     <div class="container">
-        <div class="whatsapp-logo">💬</div>
+        <div class="whatsapp-logo">&#128172;</div>
         <h1>WhatsApp Web QR Code</h1>
         <p class="subtitle">Scan this QR code with your WhatsApp mobile app</p>
-        
+
         <div class="qr-container">
             <canvas id="qrcode"></canvas>
         </div>
-        
+
         <div class="instructions">
-            <h3>📱 How to scan:</h3>
+            <h3>How to scan:</h3>
             <ol>
                 <li>Open WhatsApp on your phone</li>
                 <li>Tap <strong>Menu</strong> or <strong>Settings</strong></li>
@@ -1051,53 +2946,35 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
                 <li>Point your phone at this screen to capture the code</li>
             </ol>
         </div>
-        
+
         <div class="warning">
-            ⚠️ This QR code expires after a few minutes. Refresh the page if needed.
+            This QR code expires after a few minutes. Refresh the page if needed.
         </div>
-        
+
         <button class="refresh-btn" onclick="location.reload()">Refresh QR Code</button>
     </div>
-    
+
     <script>
         // Generate QR code using qrcode-generator library
         const qrText = "{{.QRCode}}";
         const canvas = document.getElementById('qrcode');
-        
-        // Debug logging
-        console.log('QR Text:', qrText);
-        console.log('QR Text Length:', qrText.length);
-        console.log('QR Text Type:', typeof qrText);
-        
+
         try {
-            // Try method 1: qrcode-generator library
-            console.log('Attempting Method 1: qrcode-generator library');
-            const qr = qrcode(0, 'L'); // L = Low error correction, good for clean displays
+            const qr = qrcode(0, 'L');
             qr.addData(qrText);
             qr.make();
-            
-            // Get the module count
+
             const moduleCount = qr.getModuleCount();
-            // Use larger cell size for better mobile scanning (minimum 6px per module)
             const cellSize = Math.max(6, Math.floor(320 / moduleCount));
             const canvasSize = cellSize * moduleCount;
-            
-            console.log('Module Count:', moduleCount);
-            console.log('Cell Size:', cellSize);
-            console.log('Canvas Size:', canvasSize);
-            
-            // Set canvas size
+
             canvas.width = canvasSize;
             canvas.height = canvasSize;
-            
-            // Get canvas context
+
             const ctx = canvas.getContext('2d');
-            
-            // Fill background white first
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvasSize, canvasSize);
-            
-            // Draw QR code with crisp edges
+
             ctx.imageSmoothingEnabled = false;
             for (let row = 0; row < moduleCount; row++) {
                 for (let col = 0; col < moduleCount; col++) {
@@ -1107,21 +2984,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
                     }
                 }
             }
-            
-            console.log('Method 1: QR Code rendered successfully');
         } catch (error) {
-            console.error('Method 1 failed:', error);
-            
-            // Try method 2: QRCode.js library (fallback)
             if (typeof QRCode !== 'undefined') {
                 try {
-                    console.log('Attempting Method 2: QRCode.js library');
-                    
-                    // Clear canvas
                     const ctx = canvas.getContext('2d');
                     ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    
-                    // Use QRCode.js to render directly to canvas
+
                     QRCode.toCanvas(canvas, qrText, {
                         width: 320,
                         margin: 2,
@@ -1132,22 +3000,17 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
                         errorCorrectionLevel: 'L'
                     }, function(error) {
                         if (error) {
-                            console.error('Method 2 failed:', error);
                             canvas.parentElement.innerHTML = '<p style="color: red;">Both QR code methods failed. Please refresh the page.</p>';
-                        } else {
-                            console.log('Method 2: QR Code rendered successfully');
                         }
                     });
                 } catch (error2) {
-                    console.error('Method 2 failed:', error2);
                     canvas.parentElement.innerHTML = '<p style="color: red;">All QR code generation methods failed: ' + error.message + '</p>';
                 }
             } else {
-                console.error('QRCode.js library not loaded');
                 canvas.parentElement.innerHTML = '<p style="color: red;">QR Code generation failed: ' + error.message + '</p>';
             }
         }
-        
+
         // Auto-refresh every 30 seconds to check for new QR codes
         setTimeout(() => {
             location.reload();
@@ -1167,7 +3030,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		escapedQR = strings.ReplaceAll(escapedQR, `"`, `\"`)
 		escapedQR = strings.ReplaceAll(escapedQR, "\n", "\\n")
 		escapedQR = strings.ReplaceAll(escapedQR, "\r", "\\r")
-		
+
 		data := struct {
 			QRCode string
 		}{
@@ -1188,30 +3051,30 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Handler for status API (for dashboard JS)
 	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		
+
 		authMutex.RLock()
 		authenticated := isAuthenticated
 		qrCode := currentQRCode
 		authMutex.RUnlock()
-		
+
 		// Get database stats
 		var msgCount, chatCount int64
 		var lastSyncTime *time.Time
 		var dbSize int64
-		
+
 		if messageStore != nil {
 			// Get message count
 			err := messageStore.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&msgCount)
 			if err != nil {
 				msgCount = 0
 			}
-			
+
 			// Get chat count
 			err = messageStore.db.QueryRow("SELECT COUNT(*) FROM chats").Scan(&chatCount)
 			if err != nil {
 				chatCount = 0
 			}
-			
+
 			// Get last message time
 			var lastMsg string
 			err = messageStore.db.QueryRow("SELECT MAX(timestamp) FROM messages").Scan(&lastMsg)
@@ -1220,39 +3083,39 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 					lastSyncTime = &t
 				}
 			}
-			
+
 			// Get database file size
 			if info, err := os.Stat("store/messages.db"); err == nil {
 				dbSize = info.Size()
 			}
 		}
-		
+
 		status := map[string]interface{}{
 			"sync_status": map[string]interface{}{
-				"active": authenticated && client.IsConnected(),
+				"active":        authenticated && client.IsConnected(),
 				"authenticated": authenticated,
-				"connected": client.IsConnected(),
+				"connected":     client.IsConnected(),
 			},
 			"bridge_status": map[string]interface{}{
-				"running": true,
+				"running":       true,
 				"authenticated": authenticated,
 				"api_responsive": true,
 			},
 			"statistics": map[string]interface{}{
-				"message_count": msgCount,
-				"chat_count": chatCount,
-				"last_sync_time": lastSyncTime,
+				"message_count":    msgCount,
+				"chat_count":       chatCount,
+				"last_sync_time":   lastSyncTime,
 				"database_size_mb": float64(dbSize) / (1024 * 1024),
-				"database_exists": true,
+				"database_exists":  true,
 			},
 			"authentication": map[string]interface{}{
 				"has_qr_code": qrCode != "",
-				"qr_url": "http://localhost:8080/qr",
+				"qr_url":      "http://localhost:8080/qr",
 			},
 			"last_check": time.Now(),
-			"error": nil,
+			"error":      nil,
 		}
-		
+
 		json.NewEncoder(w).Encode(status)
 	})
 
@@ -1382,12 +3245,12 @@ func main() {
 						currentQRCode = evt.Code
 						isAuthenticated = false
 						lastQRUpdate = time.Now()
-						
+
 						// Debug: Print raw QR code to see what it contains
 						fmt.Printf("DEBUG - Raw QR Code: %q\n", evt.Code)
-						
+
 						authMutex.Unlock()
-						
+
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 						fmt.Printf("\nQR Code is also available at: http://localhost:8080/qr\n")
@@ -1402,7 +3265,7 @@ func main() {
 				currentQRCode = ""
 				isAuthenticated = true
 				authMutex.Unlock()
-				
+
 				connected <- true
 				break
 			}
@@ -1423,13 +3286,13 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
-		
+
 		// Update authentication state for already logged in users
 		authMutex.Lock()
 		currentQRCode = ""
 		isAuthenticated = true
 		authMutex.Unlock()
-		
+
 		connected <- true
 	}
 
@@ -1443,11 +3306,17 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Migrate any existing LID-based chats to phone-number JIDs
+	messageStore.migrateLIDChats(client, logger)
+
+	// Start message scheduler
+	startScheduler(client, messageStore, logger)
+
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	fmt.Println("REST server and scheduler are running. Press Ctrl+C to disconnect and exit.")
 
 	// Wait for termination signal
 	<-exitChan
@@ -1508,7 +3377,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -1551,17 +3420,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
+		rawChatJID := *conversation.ID
 
 		// Try to parse the JID
-		jid, err := types.ParseJID(chatJID)
+		jid, err := types.ParseJID(rawChatJID)
 		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			logger.Warnf("Failed to parse JID %s: %v", rawChatJID, err)
 			continue
 		}
 
+		// Resolve LID JIDs to phone-number JIDs for consistent storage
+		resolvedJID, chatJID := resolveLIDToPhone(client, jid, logger)
+
 		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		name := GetChatName(client, messageStore, resolvedJID, chatJID, conversation, "", logger)
 
 		// Process messages
 		messages := conversation.Messages
@@ -1607,6 +3479,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
+				// Extract reply info
+				var replyToID, replyToSender, replyToContent string
+				if msg.Message.Message != nil {
+					replyToID, replyToSender, replyToContent = extractReplyInfo(msg.Message.Message)
+				}
+
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
@@ -1623,14 +3501,21 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						// Participant may be a LID JID string — try to resolve it
+						participantJID, pErr := types.ParseJID(*msg.Message.Key.Participant)
+						if pErr == nil && participantJID.Server == types.HiddenUserServer {
+							resolved, _ := resolveLIDToPhone(client, participantJID, logger)
+							sender = resolved.User
+						} else {
+							sender = *msg.Message.Key.Participant
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
-						sender = jid.User
+						sender = resolvedJID.User
 					}
 				} else {
-					sender = jid.User
+					sender = resolvedJID.User
 				}
 
 				// Store message
@@ -1661,6 +3546,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					replyToID,
+					replyToSender,
+					replyToContent,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
