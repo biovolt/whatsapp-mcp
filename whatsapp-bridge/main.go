@@ -12,6 +12,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -3079,8 +3080,14 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			var lastMsg string
 			err = messageStore.db.QueryRow("SELECT MAX(timestamp) FROM messages").Scan(&lastMsg)
 			if err == nil && lastMsg != "" {
-				if t, err := time.Parse("2006-01-02 15:04:05", lastMsg); err == nil {
-					lastSyncTime = &t
+				// The mattn/go-sqlite3 driver stores time.Time values with a timezone
+				// offset (e.g. "2026-06-10 11:55:07+02:00"), while the history-sync path
+				// writes "2006-01-02 15:04:05" without a zone. Try both layouts.
+				for _, layout := range []string{"2006-01-02 15:04:05.999999999-07:00", "2006-01-02 15:04:05"} {
+					if t, err := time.Parse(layout, lastMsg); err == nil {
+						lastSyncTime = &t
+						break
+					}
 				}
 			}
 
@@ -3140,10 +3147,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
-	// Run server in a goroutine so it doesn't block
+	// Bind the port synchronously, before the caller connects to WhatsApp. If
+	// another bridge instance already owns this port, fail now and exit -- this
+	// prevents a duplicate from connecting to WhatsApp and StreamReplacing the
+	// existing instance off its session, which silently breaks sending.
+	listener, err := net.Listen("tcp", serverAddr)
+	if err != nil {
+		fmt.Printf("FATAL: cannot bind REST API server on %s (another bridge instance running?): %v\n", serverAddr, err)
+		os.Exit(1)
+	}
+
+	// Serve in a goroutine so it doesn't block.
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			fmt.Printf("REST API server error: %v\n", err)
+		if err := http.Serve(listener, nil); err != nil {
+			fmt.Printf("FATAL: REST API server on %s failed: %v\n", serverAddr, err)
+			os.Exit(1)
 		}
 	}()
 }

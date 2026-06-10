@@ -16,3 +16,4 @@ __pycache__/
 
 # Local scripts (not part of repo)
 whatsapp-mcp-start.shwhatsapp-bridge/store/*.bak.*
+.DS_Store
