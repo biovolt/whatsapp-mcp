@@ -1,5 +1,6 @@
 from typing import List, Dict, Any, Optional
 import json
+import sys
 from datetime import datetime
 from fastmcp import FastMCP
 
@@ -826,15 +827,15 @@ if __name__ == "__main__":
     # Validate transport mode
     valid_transports = ['stdio', 'sse']
     if transport_mode not in valid_transports:
-        print(f"Warning: Invalid MCP_TRANSPORT '{transport_mode}', defaulting to 'stdio'")
+        print(f"Warning: Invalid MCP_TRANSPORT '{transport_mode}', defaulting to 'stdio'", file=sys.stderr)
         transport_mode = 'stdio'
 
-    print(f"Starting WhatsApp MCP server with {transport_mode} transport...")
+    print(f"Starting WhatsApp MCP server with {transport_mode} transport...", file=sys.stderr)
 
     # Initialize and run the server
     if transport_mode == 'sse':
         port = int(os.environ.get('MCP_PORT', 3000))
-        print(f"SSE transport listening on port {port}")
+        print(f"SSE transport listening on port {port}", file=sys.stderr)
         try:
             import uvicorn
             uvicorn.run(mcp.sse_app(), host='0.0.0.0', port=port)

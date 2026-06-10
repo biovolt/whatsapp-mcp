@@ -12,6 +12,21 @@ import threading
 import queue
 import psutil
 import signal
+import sys
+import builtins as _builtins
+
+
+def print(*args, **kwargs):
+    """Route all diagnostic output to stderr.
+
+    This server runs over MCP stdio transport, where stdout carries the JSON-RPC
+    protocol. Any stray write to stdout corrupts the stream and permanently
+    hangs the client (the first response gets through, every later call hangs).
+    Overriding print() here keeps every diagnostic message off stdout.
+    """
+    kwargs.setdefault("file", sys.stderr)
+    _builtins.print(*args, **kwargs)
+
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
@@ -337,18 +352,29 @@ def is_bridge_process_running() -> bool:
     
     if BRIDGE_PROCESS and BRIDGE_PROCESS.poll() is None:
         return True
-    
-    # Check if any go process is running main.go in the bridge directory
+
+    # An externally-started bridge (the compiled ./whatsapp-bridge binary, a
+    # watchdog, or a container) won't match the process heuristics below. The
+    # authoritative signal is the REST API: if it answers on :8080 a bridge is
+    # already up, and we must NOT spawn a duplicate -- a second instance connects
+    # to WhatsApp and StreamReplaces the first off its session, breaking sends.
+    if check_api_health():
+        return True
+
+    # Check if any go process is running main.go, or the compiled binary, in the
+    # bridge directory
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            if proc.info['name'] in ['go', 'main']:
-                cmdline = proc.info['cmdline']
-                if cmdline and any('main.go' in arg for arg in cmdline):
-                    if any(BRIDGE_DIR in arg for arg in cmdline):
-                        return True
+            name = proc.info['name'] or ''
+            cmdline = proc.info['cmdline'] or []
+            if name in ['go', 'main'] and any('main.go' in arg for arg in cmdline):
+                if any(BRIDGE_DIR in arg for arg in cmdline):
+                    return True
+            if 'whatsapp-bridge' in name:
+                return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    
+
     return False
 
 def check_api_health() -> bool:
@@ -1382,7 +1408,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1426,7 +1452,7 @@ def send_reply(recipient: str, message: str, reply_to_id: str, reply_to_jid: str
             "reply_to_jid": reply_to_jid,
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1493,7 +1519,7 @@ def send_file(recipient: str, media_path: str = "", media_data: str = "", filena
                 )
             payload["media_path"] = media_path
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1561,7 +1587,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
                 "media_path": media_path
             }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
 
         # Check if the request was successful
         if response.status_code == 200:
@@ -1613,7 +1639,7 @@ def download_media(message_id: str, chat_jid: str) -> dict:
             "chat_jid": chat_jid
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
 
         if response.status_code == 200:
             result = response.json()
@@ -1713,7 +1739,7 @@ def schedule_message(recipient: str, message: str, scheduled_time: str, media_pa
         if media_path:
             payload["media_path"] = media_path
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
         result = response.json()
 
         if result.get("success", False):
@@ -1744,7 +1770,7 @@ def list_scheduled_messages(status: Optional[str] = None) -> List[dict]:
         if status:
             params["status"] = status
 
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=30)
         result = response.json()
 
         if result.get("success", False):
@@ -1815,7 +1841,7 @@ def watch_channel(jid: str, name: Optional[str] = None) -> Tuple[bool, str]:
         if name:
             payload["name"] = name
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
         result = response.json()
 
         return result.get("success", False), result.get("message", "Unknown error")
@@ -1905,7 +1931,7 @@ def archive_chat(jid: str, archive: bool = True) -> Tuple[bool, str]:
             "archive": archive
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
         result = response.json()
 
         return result.get("success", False), result.get("message", "Unknown error")
@@ -1950,7 +1976,7 @@ def resync_app_state(names: Optional[List[str]] = None, force: bool = False) -> 
         if force:
             payload["force"] = True
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
         result = response.json()
 
         return {
@@ -2010,7 +2036,7 @@ def get_group_info(group_jid: str) -> dict:
         url = f"{WHATSAPP_API_BASE_URL}/group"
         params = {"jid": group_jid}
 
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=30)
         result = response.json()
 
         if result.get("success", False):
@@ -2064,7 +2090,7 @@ def add_group_members(group_jid: str, participants: List[str]) -> dict:
             "participants": participants
         }
 
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=30)
         result = response.json()
 
         return {
