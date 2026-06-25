@@ -1277,8 +1277,8 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 // resolveLIDToPhone resolves a LID-based JID to its phone-number-based JID.
-// WhatsApp is migrating from phone JIDs (e.g. 233201358015@s.whatsapp.net) to
-// LID JIDs (e.g. 15788434030727@lid). This causes the same contact to appear
+// WhatsApp is migrating from phone JIDs (e.g. 1234567890@s.whatsapp.net) to
+// LID JIDs (e.g. 9876543210123@lid). This causes the same contact to appear
 // as two separate chats. We resolve LIDs to phone JIDs so all messages for the
 // same contact are stored under a single, consistent chat JID.
 func resolveLIDToPhone(client *whatsmeow.Client, jid types.JID, logger waLog.Logger) (types.JID, string) {

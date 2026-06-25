@@ -92,12 +92,12 @@ class BridgeStatus:
 def resolve_lid_to_phone(jid: str) -> str:
     """Resolve a LID-based JID to its phone-number JID.
 
-    WhatsApp is migrating from phone JIDs (e.g. 233201358015@s.whatsapp.net) to
-    LID JIDs (e.g. 15788434030727@lid). This resolves LIDs to phone JIDs using
+    WhatsApp is migrating from phone JIDs (e.g. 1234567890@s.whatsapp.net) to
+    LID JIDs (e.g. 9876543210123@lid). This resolves LIDs to phone JIDs using
     the whatsmeow_lid_map table.
 
     Args:
-        jid: The JID to resolve (e.g., "15788434030727@lid" or "15788434030727")
+        jid: The JID to resolve (e.g., "9876543210123@lid" or "9876543210123")
 
     Returns:
         The phone-number JID if a mapping exists, otherwise the original JID
@@ -144,7 +144,7 @@ def get_contact_name_from_whatsmeow(jid: str) -> Optional[str]:
     """Get contact name from whatsmeow contacts table.
 
     Args:
-        jid: The JID to look up (e.g., "233551749015@s.whatsapp.net" or "233551749015")
+        jid: The JID to look up (e.g., "1234567890@s.whatsapp.net" or "1234567890")
 
     Returns:
         The contact's display name (full_name, push_name, or business_name), or None if not found
