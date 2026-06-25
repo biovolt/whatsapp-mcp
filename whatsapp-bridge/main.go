@@ -1515,6 +1515,12 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
+	// The DB filename is derived from a second-resolution timestamp
+	// (image_20060102_150405.jpg), so multiple media received in the same second
+	// share a filename and would overwrite each other on disk. Prefix with the
+	// message ID (unique per chat) to guarantee a distinct file per message.
+	filename = messageID + "_" + filename
+
 	// Generate a local path for the file
 	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
 
@@ -1591,13 +1597,10 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the full path AND query string: the ?ccb/oh/oe/_nc_sid tokens are the
+	// per-file media auth that the WhatsApp CDN requires. whatsmeow appends
+	// &hash=&mms-type= to this directPath, so the query must be preserved.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
