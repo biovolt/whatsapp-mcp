@@ -30,7 +30,7 @@ def print(*args, **kwargs):
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
 BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge')
 BRIDGE_EXECUTABLE = "main.go"
 BRIDGE_PROCESS = None
@@ -735,7 +735,7 @@ def ensure_bridge_ready() -> Tuple[bool, str, Optional[str]]:
         return True, "Bridge is ready and authenticated", None
     
     # Not authenticated - bridge should be serving QR code via web interface
-    qr_url = "http://localhost:8080/qr"
+    qr_url = f"{WHATSAPP_API_BASE_URL.replace('/api', '')}/qr"
     return False, "Bridge is running but not authenticated. Please scan the QR code via the web interface.", qr_url
 
 def list_messages(

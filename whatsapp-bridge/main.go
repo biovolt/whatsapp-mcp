@@ -3120,7 +3120,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			},
 			"authentication": map[string]interface{}{
 				"has_qr_code": qrCode != "",
-				"qr_url":      "http://localhost:8080/qr",
+				"qr_url":      fmt.Sprintf("%s/qr", getPublicBaseURL()),
 			},
 			"last_check": time.Now(),
 			"error":      nil,
@@ -3140,7 +3140,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		response := map[string]interface{}{
 			"authenticated": authenticated,
 			"has_qr_code":   qrCode != "",
-			"qr_url":        "http://localhost:8080/qr",
+			"qr_url":        fmt.Sprintf("%s/qr", getPublicBaseURL()),
 		}
 
 		json.NewEncoder(w).Encode(response)
@@ -3217,8 +3217,16 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Start REST API server early so QR code web interface is available
-	startRESTServer(client, messageStore, 8080)
+	// Start REST API server early so QR code web interface is available.
+	// Port is configurable via WHATSAPP_BRIDGE_PORT so multiple bridge
+	// instances can run on a single host (defaults to 8080).
+	port := 8080
+	if v := os.Getenv("WHATSAPP_BRIDGE_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			port = p
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -3274,11 +3282,11 @@ func main() {
 
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-						fmt.Printf("\nQR Code is also available at: http://localhost:8080/qr\n")
+						fmt.Printf("\nQR Code is also available at: %s/qr\n", getPublicBaseURL())
 					}
 				} else {
 					authMutex.Unlock()
-					fmt.Printf("QR code unchanged, still available at: http://localhost:8080/qr\n")
+					fmt.Printf("QR code unchanged, still available at: %s/qr\n", getPublicBaseURL())
 				}
 			} else if evt.Event == "success" {
 				// Update authentication state
