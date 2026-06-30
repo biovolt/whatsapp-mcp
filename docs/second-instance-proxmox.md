@@ -93,13 +93,26 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 useradd -r -m -d /opt/whatsapp whatsapp
 git clone https://github.com/biovolt/whatsapp-mcp.git /opt/whatsapp/whatsapp-mcp
 cd /opt/whatsapp/whatsapp-mcp/whatsapp-bridge
-CGO_ENABLED=1 go build -o whatsapp-bridge .
+CGO_ENABLED=1 go build -buildvcs=false -o whatsapp-bridge .
 chown -R whatsapp:whatsapp /opt/whatsapp
 ```
 
 > `CGO_ENABLED=1` is required — the bridge uses the `mattn/go-sqlite3` driver, which
 > needs cgo (hence `build-essential`). `libsqlite3-dev` is **not** needed; the driver
 > bundles its own SQLite C source.
+>
+> `-buildvcs=false` disables git VCS stamping. When the build user differs from the
+> `.git` owner (e.g. cloned as root, then chowned to `whatsapp`), git refuses with
+> "dubious ownership" and the build fails with `error obtaining VCS status: exit
+> status 128` — **producing no new binary**. The flag sidesteps it. Always include it
+> when rebuilding after pulling/copying new source, e.g.:
+>
+> ```bash
+> cd /opt/whatsapp/whatsapp-mcp/whatsapp-bridge
+> CGO_ENABLED=1 go build -buildvcs=false -o whatsapp-bridge .
+> chown whatsapp:whatsapp whatsapp-bridge
+> systemctl restart whatsapp-bridge
+> ```
 
 ## 4. Link the WhatsApp number (one-time, interactive)
 
@@ -141,6 +154,10 @@ Wants=network-online.target
 Type=simple
 User=whatsapp
 WorkingDirectory=/opt/whatsapp/whatsapp-mcp/whatsapp-bridge
+# Make the QR/status URLs report the container's reachable address instead of
+# localhost. Set this to the LXC IP (and the bridge port). Optional but
+# recommended on a remote host.
+Environment=WHATSAPP_PUBLIC_URL=http://192.168.10.123:8080
 ExecStart=/opt/whatsapp/whatsapp-mcp/whatsapp-bridge/whatsapp-bridge
 Restart=on-failure
 RestartSec=5

@@ -647,8 +647,9 @@ func getWebhookURL() string {
 	return os.Getenv("WHATSAPP_WEBHOOK_URL")
 }
 
-// Get public base URL for external access (e.g., https://mcp.mini.jyoansah.me)
-// If not set, falls back to localhost:8080
+// Get public base URL for external access. Set WHATSAPP_PUBLIC_URL to the
+// address other machines use to reach this bridge (e.g. http://192.168.10.123:8080
+// or https://mcp.mini.jyoansah.me). Falls back to localhost:8080 only if unset.
 func getPublicBaseURL() string {
 	url := os.Getenv("WHATSAPP_PUBLIC_URL")
 	if url == "" {
