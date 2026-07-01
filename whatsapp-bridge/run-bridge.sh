@@ -31,11 +31,12 @@ if [ -n "$pids" ]; then
   fi
 fi
 
-# Hook: forward every inbound (watched-chat) message to the wa-agent webhook.
-# The bridge reads this ONLY from the environment at startup (getWebhookURL), so
-# default it here — a plain ./run-bridge.sh then always wires the agent. Override
-# by exporting WHATSAPP_WEBHOOK_URL before calling this script.
-: "${WHATSAPP_WEBHOOK_URL:=http://127.0.0.1:9100/webhook}"
+# Hook: forward every inbound message to the wa-agent webhook. This Mac bridge is
+# linked to the PERSONAL number, so it targets the agent's /webhook/local path
+# (source:'local' -> two-number redirect). The bridge reads this ONLY from the
+# environment at startup (getWebhookURL), so default it here; override by
+# exporting WHATSAPP_WEBHOOK_URL before calling this script.
+: "${WHATSAPP_WEBHOOK_URL:=http://127.0.0.1:9100/webhook/local}"
 export WHATSAPP_WEBHOOK_URL
 
 echo "run-bridge: starting whatsapp-bridge (webhook → $WHATSAPP_WEBHOOK_URL)"
