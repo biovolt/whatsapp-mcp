@@ -1385,8 +1385,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 
-		// Check if this channel is being watched and send webhook
-		if messageStore.IsChannelWatched(chatJID) {
+		// Forward to the webhook (WHATSAPP_WEBHOOK_URL) for every direct 1:1
+		// message — a support agent must react to first-time senders, who can
+		// never be pre-"watched" — plus any explicitly watched group channel.
+		// sendWebhookNotification no-ops when no webhook URL is configured, so
+		// this is inert unless WHATSAPP_WEBHOOK_URL is set.
+		isDirectChat := strings.HasSuffix(chatJID, "@s.whatsapp.net")
+		if isDirectChat || messageStore.IsChannelWatched(chatJID) {
 			sendWebhookNotification(chatJID, name, msg.Info.ID, sender, content, msg.Info.IsFromMe, mediaType, filename, logger)
 		}
 	}
