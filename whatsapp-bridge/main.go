@@ -1559,7 +1559,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		waMediaType = whatsmeow.MediaImage
 	case "video":
 		waMediaType = whatsmeow.MediaVideo
-	case "audio":
+	case "audio", "voice_note": // a voice note is an AudioMessage with PTT set (see extractMediaInfo)
 		waMediaType = whatsmeow.MediaAudio
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
