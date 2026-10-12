@@ -3,6 +3,7 @@ import json
 import sys
 from datetime import datetime
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 # MCP-UI SDK is currently only available for TypeScript/Node.js and Ruby
 # Python implementation doesn't exist yet, so we'll use HTML-based MCP resources
@@ -42,7 +43,12 @@ import os
 mcp = FastMCP("whatsapp")
 
 def with_bridge_check(func):
-    """Decorator to ensure bridge is ready before executing MCP tools."""
+    """Decorator to ensure bridge is ready before executing MCP tools.
+
+    Failures are raised as ToolError so the client receives an MCP error
+    result. Returning an error dict instead would break the output schema
+    FastMCP derives from each tool's return annotation (e.g. a list or str).
+    """
     import functools
 
     @functools.wraps(func)
@@ -52,44 +58,30 @@ def with_bridge_check(func):
 
         if not success:
             if qr_url:
-                # Return QR URL for authentication
-                return {
-                    "error": "WhatsApp Authentication Required",
-                    "message": message,
-                    "qr_url": qr_url,
-                    "instructions": [
-                        "1. Open the QR code page in your browser:",
-                        f"   {qr_url}",
-                        "2. Open WhatsApp on your phone",
-                        "3. Go to Settings > Linked Devices",
-                        "4. Tap 'Link a Device'",
-                        "5. Scan the QR code displayed on the web page",
-                        "6. Wait for authentication to complete",
-                        "7. Try your request again"
-                    ]
-                }
-            else:
-                # Return error message
-                return {
-                    "error": "WhatsApp Bridge Error",
-                    "message": message,
-                    "troubleshooting": [
-                        "Ensure Go is installed on your system",
-                        "Check that the bridge directory exists",
-                        "Verify network connectivity",
-                        "Try restarting the MCP server"
-                    ]
-                }
+                raise ToolError(
+                    f"WhatsApp Authentication Required: {message}\n"
+                    f"1. Open the QR code page in your browser: {qr_url}\n"
+                    "2. Open WhatsApp on your phone\n"
+                    "3. Go to Settings > Linked Devices\n"
+                    "4. Tap 'Link a Device'\n"
+                    "5. Scan the QR code displayed on the web page\n"
+                    "6. Wait for authentication to complete\n"
+                    "7. Try your request again"
+                )
+            raise ToolError(
+                f"WhatsApp Bridge Error: {message}\n"
+                "Ensure Go is installed on your system, check that the bridge "
+                "directory exists, verify network connectivity, or try "
+                "restarting the MCP server."
+            )
 
         # Bridge is ready, execute the original function
         try:
             return func(*args, **kwargs)
+        except ToolError:
+            raise
         except Exception as e:
-            return {
-                "error": "Tool Execution Error",
-                "message": str(e),
-                "suggestion": "Please try again or check the bridge status"
-            }
+            raise ToolError(f"Tool Execution Error: {e}") from e
 
     return wrapper
 
@@ -117,7 +109,7 @@ def list_messages(
     include_context: bool = True,
     context_before: int = 1,
     context_after: int = 1
-) -> List[Dict[str, Any]]:
+) -> str:
     """Get WhatsApp messages matching specified criteria with optional context.
 
     Args:
@@ -186,6 +178,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
         include_last_message: Whether to include the last message (default True)
     """
     chat = whatsapp_get_chat(chat_jid, include_last_message)
+    if chat is None:
+        raise ToolError(f"No chat found for JID {chat_jid}")
     return chat
 
 @mcp.tool()
@@ -197,6 +191,8 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
         sender_phone_number: The phone number to search for
     """
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
+    if chat is None:
+        raise ToolError(f"No direct chat found for {sender_phone_number}")
     return chat
 
 @mcp.tool()
@@ -221,6 +217,8 @@ def get_last_interaction(jid: str) -> str:
         jid: The JID of the contact to search for
     """
     message = whatsapp_get_last_interaction(jid)
+    if message is None:
+        raise ToolError(f"No messages found involving {jid}")
     return message
 
 @mcp.tool()

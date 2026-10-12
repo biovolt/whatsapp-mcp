@@ -835,11 +835,11 @@ def list_messages(
             return format_messages_list(messages_with_context, show_chat_info=True)
             
         # Format and display messages without context
-        return format_messages_list(result, show_chat_info=True)    
-        
+        return format_messages_list(result, show_chat_info=True)
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
-        return []
+        raise
     finally:
         if 'conn' in locals():
             conn.close()
