@@ -33,6 +33,10 @@ WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..
 WHATSAPP_API_BASE_URL = os.environ.get("WHATSAPP_API_BASE_URL", "http://localhost:8080/api")
 BRIDGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge')
 BRIDGE_EXECUTABLE = "main.go"
+# Set to 0 when something else (e.g. systemd) runs the bridge. Otherwise a tool
+# call during a bridge restart starts a second bridge, and the two fight over
+# the port and the WhatsApp session.
+BRIDGE_AUTOSTART = os.environ.get("WHATSAPP_BRIDGE_AUTOSTART", "1") != "0"
 BRIDGE_PROCESS = None
 BRIDGE_OUTPUT_QUEUE = queue.Queue()
 QR_CODE_DATA = None
@@ -717,6 +721,8 @@ def ensure_bridge_ready() -> Tuple[bool, str, Optional[str]]:
     
     # If bridge is not running, start it
     if not status.is_running:
+        if not BRIDGE_AUTOSTART:
+            return False, "Bridge is not running (auto-start is off; check the bridge service)", None
         success, message = start_bridge_process()
         if not success:
             return False, f"Failed to start bridge: {message}", None
