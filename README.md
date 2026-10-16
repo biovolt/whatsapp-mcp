@@ -316,6 +316,21 @@ Access a visual status dashboard at `http://localhost:8080/status` when the brid
 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
 
+## Running on Proxmox (or any Debian server)
+
+To run the bridge and MCP server on a server that is always on, such as a
+Proxmox LXC container, log in as root on a fresh Debian 12 machine and run:
+
+```bash
+apt-get update && apt-get install -y curl
+curl -fsSL https://raw.githubusercontent.com/biovolt/whatsapp-mcp/main/install.sh | bash
+```
+
+It installs everything needed and sets the bridge and MCP server up as services
+that start on boot. To update later, run `/opt/whatsapp/whatsapp-mcp/update.sh`.
+See [docs/proxmox.md](docs/proxmox.md) for the full walkthrough: creating the
+container, linking your phone, connecting Claude, and setting up the firewall.
+
 ## Running in Docker
 
 The WhatsApp MCP server supports containerized deployment using Docker and Docker Compose. The container includes both the Go bridge and Python MCP server in a single, optimized image that preserves all automatic bridge management features.
