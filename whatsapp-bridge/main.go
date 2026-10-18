@@ -659,6 +659,44 @@ func getPublicBaseURL() string {
 	return strings.TrimSuffix(url, "/")
 }
 
+// shouldForward reports whether a chat's messages go to the webhook: direct
+// chats (phone JID or unresolved @lid) always, other chats only when watched.
+func shouldForward(chatJID string, watched bool) bool {
+	return strings.HasSuffix(chatJID, "@s.whatsapp.net") || strings.HasSuffix(chatJID, "@lid") || watched
+}
+
+// MessagesAfter returns stored messages newer than after, oldest first, for
+// chats that shouldForward accepts, as webhook payloads (catch-up for a
+// consumer that missed live webhooks).
+func (store *MessageStore) MessagesAfter(after time.Time, limit int) ([]WebhookPayload, error) {
+	rows, err := store.db.Query(
+		`SELECT m.id, m.chat_jid, COALESCE(c.name, ''), COALESCE(m.sender, ''), COALESCE(m.content, ''),
+			m.timestamp, m.is_from_me, COALESCE(m.media_type, ''), COALESCE(m.filename, '')
+		FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid
+		WHERE julianday(m.timestamp) > julianday(?) ORDER BY julianday(m.timestamp), m.id`,
+		after,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	payloads := []WebhookPayload{}
+	for rows.Next() && len(payloads) < limit {
+		var p WebhookPayload
+		if err := rows.Scan(&p.Message.ID, &p.Chat.JID, &p.Chat.Name, &p.Message.Sender, &p.Message.Content,
+			&p.Timestamp, &p.Message.IsFromMe, &p.Message.MediaType, &p.Message.Filename); err != nil {
+			return nil, err
+		}
+		if !shouldForward(p.Chat.JID, store.IsChannelWatched(p.Chat.JID)) {
+			continue
+		}
+		p.Event = "message"
+		payloads = append(payloads, p)
+	}
+	return payloads, rows.Err()
+}
+
 // Send webhook notification for a watched channel message
 func sendWebhookNotification(chatJID, chatName, messageID, sender, content string, isFromMe bool, mediaType, filename string, logger waLog.Logger) {
 	webhookURL := getWebhookURL()
@@ -1386,12 +1424,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 
 		// Forward to the webhook (WHATSAPP_WEBHOOK_URL) for every direct 1:1
-		// message — a support agent must react to first-time senders, who can
-		// never be pre-"watched" — plus any explicitly watched group channel.
+		// message (including unresolved @lid chats) — a support agent must react
+		// to first-time senders, who can never be pre-"watched" — plus any
+		// explicitly watched group channel.
 		// sendWebhookNotification no-ops when no webhook URL is configured, so
 		// this is inert unless WHATSAPP_WEBHOOK_URL is set.
-		isDirectChat := strings.HasSuffix(chatJID, "@s.whatsapp.net")
-		if isDirectChat || messageStore.IsChannelWatched(chatJID) {
+		if shouldForward(chatJID, messageStore.IsChannelWatched(chatJID)) {
 			sendWebhookNotification(chatJID, name, msg.Info.ID, sender, content, msg.Info.IsFromMe, mediaType, filename, logger)
 		}
 	}
@@ -1655,6 +1693,40 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	// Handler for catching up on messages missed by the webhook consumer
+	http.HandleFunc("/api/messages", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		after, err := time.Parse(time.RFC3339, r.URL.Query().Get("after"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "after must be RFC3339"})
+			return
+		}
+		limit := 500
+		if v := r.URL.Query().Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]string{"error": "limit must be a positive integer"})
+				return
+			}
+			limit = min(n, 1000)
+		}
+
+		messages, err := messageStore.MessagesAfter(after, limit)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages})
 	})
 
 	// Handler for downloading media
