@@ -386,14 +386,14 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient   string `json:"recipient"`
-	Message     string `json:"message"`
-	MediaPath   string `json:"media_path,omitempty"`   // Local file path (Go bridge will read it)
-	MediaURL    string `json:"media_url,omitempty"`    // Remote URL to download and send
-	MediaData   string `json:"media_data,omitempty"`   // Base64-encoded file data
-	Filename    string `json:"filename,omitempty"`     // Original filename (for media_data or media_url)
-	ReplyToID   string `json:"reply_to_id,omitempty"`
-	ReplyToJID  string `json:"reply_to_jid,omitempty"` // JID of the sender of the message being replied to
+	Recipient  string `json:"recipient"`
+	Message    string `json:"message"`
+	MediaPath  string `json:"media_path,omitempty"` // Local file path (Go bridge will read it)
+	MediaURL   string `json:"media_url,omitempty"`  // Remote URL to download and send
+	MediaData  string `json:"media_data,omitempty"` // Base64-encoded file data
+	Filename   string `json:"filename,omitempty"`   // Original filename (for media_data or media_url)
+	ReplyToID  string `json:"reply_to_id,omitempty"`
+	ReplyToJID string `json:"reply_to_jid,omitempty"` // JID of the sender of the message being replied to
 }
 
 // ScheduledMessage represents a message scheduled for future delivery
@@ -1444,14 +1444,14 @@ type DownloadMediaRequest struct {
 
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
-	Success       bool   `json:"success"`
-	Message       string `json:"message"`
-	Filename      string `json:"filename,omitempty"`
-	Path          string `json:"path,omitempty"`
-	MediaURL      string `json:"media_url,omitempty"`       // Relative URL path (e.g., /api/media/...)
-	PublicURL     string `json:"public_url,omitempty"`      // Full public URL for external access
-	MediaType     string `json:"media_type,omitempty"`
-	AccessNote    string `json:"access_note,omitempty"`     // Instructions for accessing the media
+	Success    bool   `json:"success"`
+	Message    string `json:"message"`
+	Filename   string `json:"filename,omitempty"`
+	Path       string `json:"path,omitempty"`
+	MediaURL   string `json:"media_url,omitempty"`  // Relative URL path (e.g., /api/media/...)
+	PublicURL  string `json:"public_url,omitempty"` // Full public URL for external access
+	MediaType  string `json:"media_type,omitempty"`
+	AccessNote string `json:"access_note,omitempty"` // Instructions for accessing the media
 }
 
 // Store additional media info in the database
@@ -2521,8 +2521,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		participants := make([]map[string]interface{}, 0)
 		for _, p := range groupInfo.Participants {
 			participant := map[string]interface{}{
-				"jid":      p.JID.String(),
-				"is_admin": p.IsAdmin,
+				"jid":            p.JID.String(),
+				"is_admin":       p.IsAdmin,
 				"is_super_admin": p.IsSuperAdmin,
 			}
 			// Try to get contact name
@@ -2536,13 +2536,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":      true,
-			"jid":          groupJID,
-			"name":         groupInfo.Name,
-			"topic":        groupInfo.Topic,
-			"created_at":   groupInfo.GroupCreated,
-			"owner_jid":    groupInfo.OwnerJID.String(),
-			"participants": participants,
+			"success":           true,
+			"jid":               groupJID,
+			"name":              groupInfo.Name,
+			"topic":             groupInfo.Topic,
+			"created_at":        groupInfo.GroupCreated,
+			"owner_jid":         groupInfo.OwnerJID.String(),
+			"participants":      participants,
 			"participant_count": len(participants),
 		})
 	})
@@ -2653,10 +2653,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			}
 
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success":  true,
-				"message":  fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
+				"success":   true,
+				"message":   fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
 				"group_jid": req.GroupJID,
-				"results":  resultInfo,
+				"results":   resultInfo,
 			})
 
 		case http.MethodDelete:
@@ -2747,10 +2747,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			}
 
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success":  true,
-				"message":  fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
+				"success":   true,
+				"message":   fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
 				"group_jid": req.GroupJID,
-				"results":  resultInfo,
+				"results":   resultInfo,
 			})
 
 		default:
@@ -3186,8 +3186,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				"connected":     client.IsConnected(),
 			},
 			"bridge_status": map[string]interface{}{
-				"running":       true,
-				"authenticated": authenticated,
+				"running":        true,
+				"authenticated":  authenticated,
 				"api_responsive": true,
 			},
 			"statistics": map[string]interface{}{
