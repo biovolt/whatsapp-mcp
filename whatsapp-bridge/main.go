@@ -697,8 +697,9 @@ func (store *MessageStore) MessagesAfter(after time.Time, limit int) ([]WebhookP
 	return payloads, rows.Err()
 }
 
-// Send webhook notification for a watched channel message
-func sendWebhookNotification(chatJID, chatName, messageID, sender, content string, isFromMe bool, mediaType, filename string, logger waLog.Logger) {
+// Send webhook notification for a watched channel message. timestamp is when the
+// message was sent (msg.Info.Timestamp), not when it is forwarded.
+func sendWebhookNotification(chatJID, chatName, messageID, sender, content string, isFromMe bool, mediaType, filename string, timestamp time.Time, logger waLog.Logger) {
 	webhookURL := getWebhookURL()
 	if webhookURL == "" {
 		return
@@ -706,7 +707,7 @@ func sendWebhookNotification(chatJID, chatName, messageID, sender, content strin
 
 	payload := WebhookPayload{
 		Event:     "message",
-		Timestamp: time.Now(),
+		Timestamp: timestamp,
 	}
 	payload.Chat.JID = chatJID
 	payload.Chat.Name = chatName
@@ -1430,7 +1431,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		// sendWebhookNotification no-ops when no webhook URL is configured, so
 		// this is inert unless WHATSAPP_WEBHOOK_URL is set.
 		if shouldForward(chatJID, messageStore.IsChannelWatched(chatJID)) {
-			sendWebhookNotification(chatJID, name, msg.Info.ID, sender, content, msg.Info.IsFromMe, mediaType, filename, logger)
+			sendWebhookNotification(chatJID, name, msg.Info.ID, sender, content, msg.Info.IsFromMe, mediaType, filename, msg.Info.Timestamp, logger)
 		}
 	}
 }

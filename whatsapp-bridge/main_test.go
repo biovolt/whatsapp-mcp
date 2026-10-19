@@ -1,8 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
+
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
 func TestShouldForward(t *testing.T) {
@@ -111,5 +116,29 @@ func TestMessagesAfterMixedOffsets(t *testing.T) {
 	}
 	if len(got) != 2 || got[0].Message.ID != "b" || got[1].Message.ID != "c" {
 		t.Errorf("got %+v, want [b c]", got)
+	}
+}
+
+func TestWebhookCarriesMessageTime(t *testing.T) {
+	got := make(chan WebhookPayload, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p WebhookPayload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			t.Errorf("decode webhook body: %v", err)
+		}
+		got <- p
+	}))
+	defer srv.Close()
+	t.Setenv("WHATSAPP_WEBHOOK_URL", srv.URL)
+
+	sent := time.Date(2026, 10, 19, 6, 30, 0, 0, time.UTC)
+	sendWebhookNotification("27820000000@s.whatsapp.net", "Anna", "M1", "27820000000", "hallo", false, "", "", sent, waLog.Noop)
+	select {
+	case p := <-got:
+		if !p.Timestamp.Equal(sent) {
+			t.Fatalf("timestamp = %v, want the message time %v", p.Timestamp, sent)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no webhook request")
 	}
 }
