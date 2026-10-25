@@ -375,6 +375,7 @@ uv run main.py               # Run with UV
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/send` | Send message (with optional reply, media) |
+| POST | `/api/poll` | Send poll `{recipient, name, options, selectable_count}` → `{success, message, id}`; votes reach the webhook as `message.poll_vote {poll_id, selected: [hex sha256 of option]}` |
 | POST | `/api/schedule` | Create scheduled message |
 | GET | `/api/schedule?status=pending` | List scheduled messages |
 | DELETE | `/api/schedule?id=123` | Cancel scheduled message |

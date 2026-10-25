@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -384,6 +385,22 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
+// SendPollRequest represents the request body for the send poll API
+type SendPollRequest struct {
+	Recipient       string   `json:"recipient"`
+	Name            string   `json:"name"`
+	Options         []string `json:"options"`
+	SelectableCount int      `json:"selectable_count"` // 0 = any number of options
+}
+
+// SendPollResponse is SendMessageResponse plus the poll's message id, which
+// votes name as poll_id.
+type SendPollResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	ID      string `json:"id,omitempty"`
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient  string `json:"recipient"`
@@ -578,13 +595,22 @@ type WebhookPayload struct {
 		Name string `json:"name"`
 	} `json:"chat"`
 	Message struct {
-		ID        string `json:"id"`
-		Sender    string `json:"sender"`
-		Content   string `json:"content"`
-		IsFromMe  bool   `json:"is_from_me"`
-		MediaType string `json:"media_type,omitempty"`
-		Filename  string `json:"filename,omitempty"`
+		ID        string    `json:"id"`
+		Sender    string    `json:"sender"`
+		Content   string    `json:"content"`
+		IsFromMe  bool      `json:"is_from_me"`
+		MediaType string    `json:"media_type,omitempty"`
+		Filename  string    `json:"filename,omitempty"`
+		PollVote  *PollVote `json:"poll_vote,omitempty"`
 	} `json:"message"`
+}
+
+// PollVote is a decrypted vote on a poll this bridge sent: the poll's message id
+// and the hex SHA-256 of each option now ticked (the full selection, so an empty
+// list means every option was unticked).
+type PollVote struct {
+	PollID   string   `json:"poll_id"`
+	Selected []string `json:"selected"`
 }
 
 // Add a channel to the watch list
@@ -717,7 +743,31 @@ func sendWebhookNotification(chatJID, chatName, messageID, sender, content strin
 	payload.Message.IsFromMe = isFromMe
 	payload.Message.MediaType = mediaType
 	payload.Message.Filename = filename
+	postWebhook(webhookURL, payload, chatJID, logger)
+}
 
+// Send webhook notification for a poll vote, like sendWebhookNotification with
+// an empty content.
+func sendPollVoteWebhook(chatJID, chatName, messageID, sender string, isFromMe bool, vote PollVote, timestamp time.Time, logger waLog.Logger) {
+	webhookURL := getWebhookURL()
+	if webhookURL == "" {
+		return
+	}
+
+	payload := WebhookPayload{
+		Event:     "message",
+		Timestamp: timestamp,
+	}
+	payload.Chat.JID = chatJID
+	payload.Chat.Name = chatName
+	payload.Message.ID = messageID
+	payload.Message.Sender = sender
+	payload.Message.IsFromMe = isFromMe
+	payload.Message.PollVote = &vote
+	postWebhook(webhookURL, payload, chatJID, logger)
+}
+
+func postWebhook(webhookURL string, payload WebhookPayload, chatJID string, logger waLog.Logger) {
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		logger.Warnf("Failed to marshal webhook payload: %v", err)
@@ -1021,6 +1071,50 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 // mediaURL: remote URL to download
 // mediaDataB64: base64-encoded file data
 // filename: optional filename for URL or base64 data
+// validatePoll returns why a poll request cannot be sent, or "". Options must be
+// unique: a vote names them only by their hash.
+func validatePoll(req SendPollRequest) string {
+	if req.Recipient == "" {
+		return "Recipient is required"
+	}
+	if req.Name == "" {
+		return "Name is required"
+	}
+	if len(req.Options) < 2 {
+		return "At least two options are required"
+	}
+	seen := map[string]bool{}
+	for _, o := range req.Options {
+		if o == "" || seen[o] {
+			return "Options must be unique and not empty"
+		}
+		seen[o] = true
+	}
+	if req.SelectableCount < 0 || req.SelectableCount > len(req.Options) {
+		return "selectable_count must be between 0 and the number of options"
+	}
+	return ""
+}
+
+// sendPoll sends a poll to a phone number or JID and returns its message id.
+func sendPoll(client *whatsmeow.Client, req SendPollRequest) (bool, string, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp", ""
+	}
+	to := types.JID{User: req.Recipient, Server: "s.whatsapp.net"}
+	if strings.Contains(req.Recipient, "@") {
+		var err error
+		if to, err = types.ParseJID(req.Recipient); err != nil {
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
+		}
+	}
+	resp, err := client.SendMessage(context.Background(), to, client.BuildPollCreation(req.Name, req.Options, req.SelectableCount))
+	if err != nil {
+		return false, fmt.Sprintf("Error sending poll: %v", err), ""
+	}
+	return true, fmt.Sprintf("Poll sent to %s", req.Recipient), resp.ID
+}
+
 func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, message string, mediaPath string, mediaURL string, mediaDataB64 string, filename string, replyToID string, replyToJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
@@ -1367,6 +1461,25 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store chat: %v", err)
 	}
 
+	// A vote on a poll this bridge sent carries no text: it is decrypted and
+	// forwarded on its own, and not stored.
+	if pollUpdate := msg.Message.GetPollUpdateMessage(); pollUpdate != nil {
+		vote, err := client.DecryptPollVote(context.Background(), msg)
+		if err != nil {
+			logger.Warnf("Failed to decrypt poll vote %s: %v", msg.Info.ID, err)
+			return
+		}
+		selected := make([]string, 0, len(vote.GetSelectedOptions()))
+		for _, hash := range vote.GetSelectedOptions() {
+			selected = append(selected, hex.EncodeToString(hash))
+		}
+		fmt.Printf("[%s] poll vote from %s: %d selected\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, len(selected))
+		if shouldForward(chatJID, messageStore.IsChannelWatched(chatJID)) {
+			sendPollVoteWebhook(chatJID, name, msg.Info.ID, sender, msg.Info.IsFromMe, PollVote{PollID: pollUpdate.GetPollCreationMessageKey().GetID(), Selected: selected}, msg.Info.Timestamp, logger)
+		}
+		return
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -1694,6 +1807,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	// Handler for sending a poll
+	http.HandleFunc("/api/poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req SendPollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if msg := validatePoll(req); msg != "" {
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+		success, message, id := sendPoll(client, req)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendPollResponse{Success: success, Message: message, ID: id})
 	})
 
 	// Handler for catching up on messages missed by the webhook consumer

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,5 +141,57 @@ func TestWebhookCarriesMessageTime(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("no webhook request")
+	}
+}
+
+func TestPollVoteWebhook(t *testing.T) {
+	got := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			t.Errorf("decode webhook body: %v", err)
+		}
+		got <- p
+	}))
+	defer srv.Close()
+	t.Setenv("WHATSAPP_WEBHOOK_URL", srv.URL)
+
+	sendPollVoteWebhook("27820000000@s.whatsapp.net", "Dina", "V1", "27820000000", false, PollVote{PollID: "P1", Selected: []string{"ab", "cd"}}, time.Now(), waLog.Noop)
+	select {
+	case p := <-got:
+		msg := p["message"].(map[string]any)
+		vote, _ := json.Marshal(msg["poll_vote"])
+		if msg["id"] != "V1" || msg["content"] != "" || string(vote) != `{"poll_id":"P1","selected":["ab","cd"]}` {
+			t.Fatalf("message = %v", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no webhook request")
+	}
+}
+
+func TestWebhookWithoutVoteHasNoPollVote(t *testing.T) {
+	b, _ := json.Marshal(WebhookPayload{})
+	if strings.Contains(string(b), "poll_vote") {
+		t.Fatalf("payload = %s", b)
+	}
+}
+
+func TestValidatePoll(t *testing.T) {
+	ok := SendPollRequest{Recipient: "27820000000", Name: "Klaar?", Options: []string{"1. A", "2. B"}}
+	if msg := validatePoll(ok); msg != "" {
+		t.Fatalf("valid poll refused: %s", msg)
+	}
+	bad := []SendPollRequest{
+		{Name: "x", Options: []string{"a", "b"}},
+		{Recipient: "1", Options: []string{"a", "b"}},
+		{Recipient: "1", Name: "x", Options: []string{"a"}},
+		{Recipient: "1", Name: "x", Options: []string{"a", "a"}},
+		{Recipient: "1", Name: "x", Options: []string{"a", ""}},
+		{Recipient: "1", Name: "x", Options: []string{"a", "b"}, SelectableCount: 3},
+	}
+	for _, req := range bad {
+		if validatePoll(req) == "" {
+			t.Errorf("accepted %+v", req)
+		}
 	}
 }
