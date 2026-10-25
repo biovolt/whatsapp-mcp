@@ -53,6 +53,8 @@ has_mcp=false
 if systemctl cat "$MCP_SERVICE" >/dev/null 2>&1; then
   has_mcp=true
   UV="$(command -v uv || true)"
+  # install.sh puts uv in /usr/local/bin, which a `pct exec` PATH may lack (like go above).
+  [ -x /usr/local/bin/uv ] && UV=/usr/local/bin/uv
   if [ -n "$UV" ]; then
     echo "update: syncing the MCP server's Python environment"
     (cd whatsapp-mcp-server && as_owner "$UV" sync --frozen)
