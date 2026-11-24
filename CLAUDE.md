@@ -110,7 +110,8 @@ Set in `compose/mini/whatsapp-mcp.yml`:
 | Variable | Purpose |
 |----------|---------|
 | `MCP_TRANSPORT=sse` | MCP server uses SSE transport (not stdio) |
-| `WHATSAPP_WEBHOOK_URL` | n8n webhook for watched channel notifications |
+| `WHATSAPP_WEBHOOK_URL` | n8n webhook for watched channel notifications; poll votes are kept in `webhook_outbox` and retried until accepted |
+| `WHATSAPP_WEBHOOK_SECRET` | optional; sent as the `X-Webhook-Secret` header on every webhook POST |
 
 ---
 

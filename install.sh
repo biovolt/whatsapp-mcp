@@ -132,6 +132,8 @@ WHATSAPP_BRIDGE_PORT=$BRIDGE_PORT
 
 # Optional: POST every incoming message to this URL.
 #WHATSAPP_WEBHOOK_URL=http://192.0.2.10:9100/webhook
+# Optional: sent as the X-Webhook-Secret header with every webhook POST.
+#WHATSAPP_WEBHOOK_SECRET=
 
 # MCP server: SSE transport so Claude on another machine can connect.
 MCP_TRANSPORT=sse

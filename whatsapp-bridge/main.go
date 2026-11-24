@@ -119,6 +119,16 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
+
+		-- Poll votes waiting for the webhook (unix seconds): kept until delivered.
+		CREATE TABLE IF NOT EXISTS webhook_outbox (
+			seq INTEGER PRIMARY KEY AUTOINCREMENT,
+			payload TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			next_try_at INTEGER NOT NULL,
+			delivered_at INTEGER
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -747,8 +757,9 @@ func sendWebhookNotification(chatJID, chatName, messageID, sender, content strin
 }
 
 // Send webhook notification for a poll vote, like sendWebhookNotification with
-// an empty content.
-func sendPollVoteWebhook(chatJID, chatName, messageID, sender string, isFromMe bool, vote PollVote, timestamp time.Time, logger waLog.Logger) {
+// an empty content. The vote is stored in the outbox first and delivered from
+// there, so a webhook that is down gets it later (a vote cannot be fetched again).
+func sendPollVoteWebhook(store *MessageStore, chatJID, chatName, messageID, sender string, isFromMe bool, vote PollVote, timestamp time.Time, logger waLog.Logger) {
 	webhookURL := getWebhookURL()
 	if webhookURL == "" {
 		return
@@ -764,7 +775,162 @@ func sendPollVoteWebhook(chatJID, chatName, messageID, sender string, isFromMe b
 	payload.Message.Sender = sender
 	payload.Message.IsFromMe = isFromMe
 	payload.Message.PollVote = &vote
-	postWebhook(webhookURL, payload, chatJID, logger)
+	if err := store.EnqueueWebhook(payload); err != nil {
+		logger.Warnf("Failed to store poll vote %s for the webhook: %v", messageID, err)
+		return
+	}
+	outboxRuns.Add(1)
+	go func() {
+		defer outboxRuns.Done()
+		deliverWebhooks(store, logger)
+	}()
+}
+
+// outboxRuns counts the deliveries started for a new vote (tests wait for them).
+var outboxRuns sync.WaitGroup
+
+// webhookNow is the outbox clock (tests replace it).
+var webhookNow = time.Now
+
+// webhookClient posts every webhook; the timeout keeps a hung receiver from
+// holding a delivery forever. Redirects are not followed: a POST would be
+// re-sent as a GET (and the secret header passed on), so a 3xx counts as a failure.
+var webhookClient = &http.Client{
+	Timeout:       15 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// outboxMu lets one outbox delivery run at a time, so a vote is never posted twice at once.
+var outboxMu sync.Mutex
+
+// Delivered outbox rows are kept this long (seconds), then deleted.
+const outboxKeep = 14 * 24 * 60 * 60
+
+// newWebhookRequest builds a webhook POST; with WHATSAPP_WEBHOOK_SECRET set it
+// carries that value in X-Webhook-Secret so the receiver can check the sender.
+func newWebhookRequest(webhookURL string, body []byte) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodPost, webhookURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret := os.Getenv("WHATSAPP_WEBHOOK_SECRET"); secret != "" {
+		req.Header.Set("X-Webhook-Secret", secret)
+	}
+	return req, nil
+}
+
+// EnqueueWebhook stores a payload in the outbox, due at once.
+func (store *MessageStore) EnqueueWebhook(payload WebhookPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	now := webhookNow().Unix()
+	_, err = store.db.Exec("INSERT INTO webhook_outbox (payload, created_at, next_try_at) VALUES (?, ?, ?)", string(body), now, now)
+	return err
+}
+
+// outboxBackoff is the wait after a failed delivery: 1, 5, 15 minutes, then hourly.
+func outboxBackoff(attempts int) time.Duration {
+	steps := []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute}
+	if attempts >= 1 && attempts <= len(steps) {
+		return steps[attempts-1]
+	}
+	return time.Hour
+}
+
+// deliverWebhooks posts the undelivered outbox rows oldest first, and only when
+// the oldest one is due. A 2xx marks a row delivered; anything else sets its next
+// try and ends the pass, so a later vote never overtakes an earlier one (a row
+// the receiver keeps refusing holds back the rows behind it, retried hourly).
+// Delivered rows older than outboxKeep are deleted.
+func deliverWebhooks(store *MessageStore, logger waLog.Logger) {
+	if !outboxMu.TryLock() {
+		return
+	}
+	defer outboxMu.Unlock()
+	webhookURL := getWebhookURL()
+	if webhookURL == "" {
+		return
+	}
+	now := webhookNow().Unix()
+	if _, err := store.db.Exec("DELETE FROM webhook_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?", now-outboxKeep); err != nil {
+		logger.Warnf("Failed to prune the webhook outbox: %v", err)
+	}
+
+	type due struct {
+		seq       int64
+		payload   string
+		attempts  int
+		nextTryAt int64
+	}
+	rows, err := store.db.Query("SELECT seq, payload, attempts, next_try_at FROM webhook_outbox WHERE delivered_at IS NULL ORDER BY seq LIMIT 50")
+	if err != nil {
+		logger.Warnf("Failed to read the webhook outbox: %v", err)
+		return
+	}
+	var list []due
+	for rows.Next() {
+		var d due
+		if err := rows.Scan(&d.seq, &d.payload, &d.attempts, &d.nextTryAt); err != nil {
+			rows.Close()
+			logger.Warnf("Failed to read the webhook outbox: %v", err)
+			return
+		}
+		list = append(list, d)
+	}
+	rows.Close()
+	if len(list) == 0 || list[0].nextTryAt > now {
+		return
+	}
+
+	for _, d := range list {
+		ok, reason := postOutboxRow(webhookURL, []byte(d.payload))
+		if ok {
+			if _, err := store.db.Exec("UPDATE webhook_outbox SET delivered_at = ? WHERE seq = ?", webhookNow().Unix(), d.seq); err != nil {
+				logger.Warnf("Failed to mark webhook %d delivered: %v", d.seq, err)
+				return
+			}
+			continue
+		}
+		attempts := d.attempts + 1
+		next := webhookNow().Add(outboxBackoff(attempts)).Unix()
+		if _, err := store.db.Exec("UPDATE webhook_outbox SET attempts = ?, next_try_at = ? WHERE seq = ?", attempts, next, d.seq); err != nil {
+			logger.Warnf("Failed to reschedule webhook %d: %v", d.seq, err)
+		}
+		logger.Warnf("Webhook %d not delivered (attempt %d): %s; next try in %s", d.seq, attempts, reason, outboxBackoff(attempts))
+		return
+	}
+}
+
+// postOutboxRow posts one stored payload and reports whether it was accepted (2xx).
+func postOutboxRow(webhookURL string, body []byte) (bool, string) {
+	req, err := newWebhookRequest(webhookURL, body)
+	if err != nil {
+		return false, err.Error()
+	}
+	resp, err := webhookClient.Do(req)
+	if err != nil {
+		return false, err.Error()
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, fmt.Sprintf("status %d", resp.StatusCode)
+	}
+	return true, ""
+}
+
+// startWebhookOutbox retries undelivered outbox rows every 10 seconds.
+func startWebhookOutbox(store *MessageStore, logger waLog.Logger) {
+	ticker := time.NewTicker(10 * time.Second)
+	go func() {
+		deliverWebhooks(store, logger)
+		for range ticker.C {
+			deliverWebhooks(store, logger)
+		}
+	}()
 }
 
 func postWebhook(webhookURL string, payload WebhookPayload, chatJID string, logger waLog.Logger) {
@@ -773,9 +939,14 @@ func postWebhook(webhookURL string, payload WebhookPayload, chatJID string, logg
 		logger.Warnf("Failed to marshal webhook payload: %v", err)
 		return
 	}
+	req, err := newWebhookRequest(webhookURL, jsonData)
+	if err != nil {
+		logger.Warnf("Failed to build webhook request: %v", err)
+		return
+	}
 
 	go func() {
-		resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
+		resp, err := webhookClient.Do(req)
 		if err != nil {
 			logger.Warnf("Failed to send webhook: %v", err)
 			return
@@ -1475,7 +1646,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 		fmt.Printf("[%s] poll vote from %s: %d selected\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, len(selected))
 		if shouldForward(chatJID, messageStore.IsChannelWatched(chatJID)) {
-			sendPollVoteWebhook(chatJID, name, msg.Info.ID, sender, msg.Info.IsFromMe, PollVote{PollID: pollUpdate.GetPollCreationMessageKey().GetID(), Selected: selected}, msg.Info.Timestamp, logger)
+			sendPollVoteWebhook(messageStore, chatJID, name, msg.Info.ID, sender, msg.Info.IsFromMe, PollVote{PollID: pollUpdate.GetPollCreationMessageKey().GetID(), Selected: selected}, msg.Info.Timestamp, logger)
 		}
 		return
 	}
@@ -3555,6 +3726,7 @@ func main() {
 
 	// Start message scheduler
 	startScheduler(client, messageStore, logger)
+	startWebhookOutbox(messageStore, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
