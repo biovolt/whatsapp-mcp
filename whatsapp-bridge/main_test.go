@@ -246,17 +246,30 @@ func TestVoteOutboxRetriesUntilAccepted(t *testing.T) {
 	}
 }
 
-func TestVoteOutboxStopsAtFirstFailure(t *testing.T) {
+func TestRefusedVoteDoesNotHoldBackOthers(t *testing.T) {
 	store := newOutboxStore(t)
 	now := time.Date(2026, 11, 24, 7, 30, 0, 0, time.UTC)
 	setOutboxClock(t, &now)
-	var calls int32
+	got := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.WriteHeader(http.StatusServiceUnavailable)
+		var p WebhookPayload
+		json.NewDecoder(r.Body).Decode(&p)
+		got <- p.Message.ID
+		if p.Message.ID == "V1" {
+			w.WriteHeader(http.StatusUnauthorized)
+		}
 	}))
 	defer srv.Close()
 	t.Setenv("WHATSAPP_WEBHOOK_URL", srv.URL)
+	// deliverWebhooks posts before it returns, so a post that did not happen reads as "" (no hang).
+	next := func() string {
+		select {
+		case id := <-got:
+			return id
+		default:
+			return ""
+		}
+	}
 
 	for _, id := range []string{"V1", "V2"} {
 		if err := store.EnqueueWebhook(votePayload(id, "P1")); err != nil {
@@ -264,34 +277,60 @@ func TestVoteOutboxStopsAtFirstFailure(t *testing.T) {
 		}
 	}
 	deliverWebhooks(store, waLog.Noop)
-	if calls != 1 {
-		t.Fatalf("calls=%d, want 1: a later vote must not overtake a failed one", calls)
+	if a, b := next(), next(); a != "V1" || b != "V2" {
+		t.Fatalf("posted %s, %s; want V1 then V2", a, b)
+	}
+	if n := pendingWebhooks(t, store); n != 1 {
+		t.Fatalf("pending = %d, want 1 (only the refused V1)", n)
+	}
+	now = now.Add(5 * time.Second)
+	if err := store.EnqueueWebhook(votePayload("V3", "P1")); err != nil {
+		t.Fatal(err)
+	}
+	deliverWebhooks(store, waLog.Noop)
+	if id := next(); id != "V3" {
+		t.Fatalf("posted %s, want V3 while V1 waits for its retry", id)
 	}
 }
 
-func TestLaterVoteWaitsBehindAFailedOne(t *testing.T) {
+func TestUnreachableWebhookEndsThePass(t *testing.T) {
 	store := newOutboxStore(t)
 	now := time.Date(2026, 11, 24, 7, 30, 0, 0, time.UTC)
 	setOutboxClock(t, &now)
-	var calls int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&calls, 1)
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-	t.Setenv("WHATSAPP_WEBHOOK_URL", srv.URL)
+	t.Setenv("WHATSAPP_WEBHOOK_URL", "http://127.0.0.1:1/down")
+	for _, id := range []string{"V1", "V2"} {
+		if err := store.EnqueueWebhook(votePayload(id, "P1")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deliverWebhooks(store, waLog.Noop)
+	var tried int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM webhook_outbox WHERE attempts > 0").Scan(&tried); err != nil {
+		t.Fatal(err)
+	}
+	if tried != 1 {
+		t.Fatalf("tried %d rows, want 1: a receiver that does not answer ends the pass", tried)
+	}
+}
 
-	if err := store.EnqueueWebhook(votePayload("V1", "P1")); err != nil {
-		t.Fatal(err)
+func TestOutboxStats(t *testing.T) {
+	store := newOutboxStore(t)
+	now := time.Date(2026, 11, 24, 7, 30, 0, 0, time.UTC)
+	setOutboxClock(t, &now)
+	if n, oldest, err := store.OutboxStats(); err != nil || n != 0 || oldest != nil {
+		t.Fatalf("empty outbox: %d, %v, %v", n, oldest, err)
 	}
-	deliverWebhooks(store, waLog.Noop)
-	now = now.Add(5 * time.Second)
-	if err := store.EnqueueWebhook(votePayload("V2", "P1")); err != nil {
-		t.Fatal(err)
+	t.Setenv("WHATSAPP_WEBHOOK_URL", "http://127.0.0.1:1/down")
+	store.EnqueueWebhook(votePayload("V1", "P1"))
+	now = now.Add(time.Minute)
+	store.EnqueueWebhook(votePayload("V2", "P1"))
+	n, oldest, err := store.OutboxStats()
+	if err != nil || n != 2 || oldest == nil || !oldest.Equal(time.Date(2026, 11, 24, 7, 30, 0, 0, time.UTC)) {
+		t.Fatalf("stats = %d, %v, %v; want 2 waiting since 07:30", n, oldest, err)
 	}
-	deliverWebhooks(store, waLog.Noop)
-	if calls != 1 {
-		t.Fatalf("calls=%d, want 1: V2 must wait while V1 waits for its retry", calls)
+	store.db.Close()
+	if _, _, err := store.OutboxStats(); err == nil {
+		t.Fatal("a store that cannot be read gave no error")
 	}
 }
 

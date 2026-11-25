@@ -123,7 +123,7 @@ All settings live in `/etc/default/whatsapp-mcp`:
 |---|---|---|
 | `WHATSAPP_PUBLIC_URL` | `http://<container-ip>:8080` | The address shown on the QR and status pages |
 | `WHATSAPP_BRIDGE_PORT` | `8080` | The bridge's port |
-| `WHATSAPP_WEBHOOK_URL` | not set | If set, every incoming message is POSTed to this URL. Poll votes are stored first and sent in order, retried (after 1, 5, 15 minutes, then hourly) until the URL answers 2xx, also across restarts; while one is refused, the votes after it wait (the log shows `Webhook <n> not delivered`) |
+| `WHATSAPP_WEBHOOK_URL` | not set | If set, every incoming message is POSTed to this URL. Poll votes are stored first and each is retried on its own (after 1, 5, 15 minutes, then hourly) until the URL answers 2xx, also across restarts. A refused vote holds back no other; the log shows `Webhook <n> not delivered`, and `/api/status` shows `webhook_outbox.pending` (votes not yet delivered) and `oldest` |
 | `WHATSAPP_WEBHOOK_SECRET` | not set | If set, every webhook POST carries it in the `X-Webhook-Secret` header |
 | `MCP_TRANSPORT` | `sse` | How Claude talks to the MCP server |
 | `MCP_PORT` | `3000` | The MCP server's port |

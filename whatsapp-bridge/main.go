@@ -840,11 +840,13 @@ func outboxBackoff(attempts int) time.Duration {
 	return time.Hour
 }
 
-// deliverWebhooks posts the undelivered outbox rows oldest first, and only when
-// the oldest one is due. A 2xx marks a row delivered; anything else sets its next
-// try and ends the pass, so a later vote never overtakes an earlier one (a row
-// the receiver keeps refusing holds back the rows behind it, retried hourly).
-// Delivered rows older than outboxKeep are deleted.
+// deliverWebhooks posts the due outbox rows oldest first. A 2xx marks a row
+// delivered; a refusal (any other answer) sets that row's next try and the pass
+// goes on, so one refused vote never holds back the others. A receiver that does
+// not answer at all ends the pass (the rest would fail the same way). Order is not
+// needed: each vote carries its poll's full selection and the time it was cast, and
+// the receiver ignores a vote older than one it has applied. Delivered rows older
+// than outboxKeep are deleted.
 func deliverWebhooks(store *MessageStore, logger waLog.Logger) {
 	if !outboxMu.TryLock() {
 		return
@@ -860,12 +862,11 @@ func deliverWebhooks(store *MessageStore, logger waLog.Logger) {
 	}
 
 	type due struct {
-		seq       int64
-		payload   string
-		attempts  int
-		nextTryAt int64
+		seq      int64
+		payload  string
+		attempts int
 	}
-	rows, err := store.db.Query("SELECT seq, payload, attempts, next_try_at FROM webhook_outbox WHERE delivered_at IS NULL ORDER BY seq LIMIT 50")
+	rows, err := store.db.Query("SELECT seq, payload, attempts FROM webhook_outbox WHERE delivered_at IS NULL AND next_try_at <= ? ORDER BY seq LIMIT 50", now)
 	if err != nil {
 		logger.Warnf("Failed to read the webhook outbox: %v", err)
 		return
@@ -873,7 +874,7 @@ func deliverWebhooks(store *MessageStore, logger waLog.Logger) {
 	var list []due
 	for rows.Next() {
 		var d due
-		if err := rows.Scan(&d.seq, &d.payload, &d.attempts, &d.nextTryAt); err != nil {
+		if err := rows.Scan(&d.seq, &d.payload, &d.attempts); err != nil {
 			rows.Close()
 			logger.Warnf("Failed to read the webhook outbox: %v", err)
 			return
@@ -881,12 +882,9 @@ func deliverWebhooks(store *MessageStore, logger waLog.Logger) {
 		list = append(list, d)
 	}
 	rows.Close()
-	if len(list) == 0 || list[0].nextTryAt > now {
-		return
-	}
 
 	for _, d := range list {
-		ok, reason := postOutboxRow(webhookURL, []byte(d.payload))
+		ok, answered, reason := postOutboxRow(webhookURL, []byte(d.payload))
 		if ok {
 			if _, err := store.db.Exec("UPDATE webhook_outbox SET delivered_at = ? WHERE seq = ?", webhookNow().Unix(), d.seq); err != nil {
 				logger.Warnf("Failed to mark webhook %d delivered: %v", d.seq, err)
@@ -900,26 +898,44 @@ func deliverWebhooks(store *MessageStore, logger waLog.Logger) {
 			logger.Warnf("Failed to reschedule webhook %d: %v", d.seq, err)
 		}
 		logger.Warnf("Webhook %d not delivered (attempt %d): %s; next try in %s", d.seq, attempts, reason, outboxBackoff(attempts))
-		return
+		if !answered {
+			return
+		}
 	}
 }
 
-// postOutboxRow posts one stored payload and reports whether it was accepted (2xx).
-func postOutboxRow(webhookURL string, body []byte) (bool, string) {
+// postOutboxRow posts one stored payload: ok when accepted (2xx), answered when the
+// receiver gave any HTTP answer at all.
+func postOutboxRow(webhookURL string, body []byte) (ok, answered bool, reason string) {
 	req, err := newWebhookRequest(webhookURL, body)
 	if err != nil {
-		return false, err.Error()
+		return false, false, err.Error()
 	}
 	resp, err := webhookClient.Do(req)
 	if err != nil {
-		return false, err.Error()
+		return false, false, err.Error()
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Sprintf("status %d", resp.StatusCode)
+		return false, true, fmt.Sprintf("status %d", resp.StatusCode)
 	}
-	return true, ""
+	return true, true, ""
+}
+
+// OutboxStats is the number of outbox rows not yet delivered and when the oldest
+// of them was stored (nil when none), for /api/status.
+func (store *MessageStore) OutboxStats() (int, *time.Time, error) {
+	var n int
+	var oldest sql.NullInt64
+	if err := store.db.QueryRow("SELECT COUNT(*), MIN(created_at) FROM webhook_outbox WHERE delivered_at IS NULL").Scan(&n, &oldest); err != nil {
+		return 0, nil, err
+	}
+	if !oldest.Valid {
+		return n, nil, nil
+	}
+	t := time.Unix(oldest.Int64, 0).UTC()
+	return n, &t, nil
 }
 
 // startWebhookOutbox retries undelivered outbox rows every 10 seconds.
@@ -3510,6 +3526,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			},
 			"last_check": time.Now(),
 			"error":      nil,
+		}
+		if messageStore != nil {
+			if pending, oldest, err := messageStore.OutboxStats(); err != nil {
+				status["webhook_outbox"] = map[string]interface{}{"error": err.Error()}
+			} else {
+				status["webhook_outbox"] = map[string]interface{}{"pending": pending, "oldest": oldest}
+			}
 		}
 
 		json.NewEncoder(w).Encode(status)
