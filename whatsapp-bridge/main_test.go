@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestShouldForward(t *testing.T) {
@@ -209,6 +211,21 @@ func setOutboxClock(t *testing.T, now *time.Time) {
 	t.Helper()
 	webhookNow = func() time.Time { return *now }
 	t.Cleanup(func() { webhookNow = time.Now })
+}
+
+func TestPollVoteCarriesThePhonesMillisecondTime(t *testing.T) {
+	update := &waProto.PollUpdateMessage{
+		PollCreationMessageKey: &waProto.MessageKey{ID: proto.String("P1")},
+		SenderTimestampMS:      proto.Int64(1764169418412),
+	}
+	vote, _ := json.Marshal(pollVoteFrom(update, []string{"ab"}))
+	if string(vote) != `{"poll_id":"P1","selected":["ab"],"sender_timestamp_ms":1764169418412}` {
+		t.Fatalf("vote = %s", vote)
+	}
+	vote, _ = json.Marshal(pollVoteFrom(&waProto.PollUpdateMessage{PollCreationMessageKey: &waProto.MessageKey{ID: proto.String("P2")}}, []string{}))
+	if string(vote) != `{"poll_id":"P2","selected":[]}` {
+		t.Fatalf("vote without a phone time = %s", vote)
+	}
 }
 
 func TestVoteOutboxRetriesUntilAccepted(t *testing.T) {

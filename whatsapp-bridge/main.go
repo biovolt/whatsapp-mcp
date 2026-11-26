@@ -617,10 +617,17 @@ type WebhookPayload struct {
 
 // PollVote is a decrypted vote on a poll this bridge sent: the poll's message id
 // and the hex SHA-256 of each option now ticked (the full selection, so an empty
-// list means every option was unticked).
+// list means every option was unticked). SenderTimestampMS is when the voter's
+// phone made the vote, in milliseconds (omitted when the phone sent none): the
+// message time has whole seconds only, so quick ticks share it.
 type PollVote struct {
-	PollID   string   `json:"poll_id"`
-	Selected []string `json:"selected"`
+	PollID            string   `json:"poll_id"`
+	Selected          []string `json:"selected"`
+	SenderTimestampMS int64    `json:"sender_timestamp_ms,omitempty"`
+}
+
+func pollVoteFrom(update *waProto.PollUpdateMessage, selected []string) PollVote {
+	return PollVote{PollID: update.GetPollCreationMessageKey().GetID(), Selected: selected, SenderTimestampMS: update.GetSenderTimestampMS()}
 }
 
 // Add a channel to the watch list
@@ -1662,7 +1669,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 		fmt.Printf("[%s] poll vote from %s: %d selected\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), sender, len(selected))
 		if shouldForward(chatJID, messageStore.IsChannelWatched(chatJID)) {
-			sendPollVoteWebhook(messageStore, chatJID, name, msg.Info.ID, sender, msg.Info.IsFromMe, PollVote{PollID: pollUpdate.GetPollCreationMessageKey().GetID(), Selected: selected}, msg.Info.Timestamp, logger)
+			sendPollVoteWebhook(messageStore, chatJID, name, msg.Info.ID, sender, msg.Info.IsFromMe, pollVoteFrom(pollUpdate, selected), msg.Info.Timestamp, logger)
 		}
 		return
 	}
